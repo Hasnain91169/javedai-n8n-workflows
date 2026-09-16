@@ -1,0 +1,279 @@
+{
+  "name": "JavedAI 04 - Email Find and Verify",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## SETUP REQUIRED\n\nPurpose: accept person-level records, find a work email with Anymail Finder, verify it with NeverBounce, and return canonical verified/risky/rejected classifications with suppression flags.\n\n1. Create server environment variable JAVEDAI_WORKFLOW_KEY and send it in the x-javedai-key header.\n2. On **Anymail Finder - Find Person Email**, select a Header Auth credential whose header is Authorization and whose value is Bearer plus your Anymail Finder API key.\n3. On **NeverBounce - Verify Email**, select a Query Auth credential with parameter name key and your NeverBounce API key as its value. The key is therefore never embedded in the URL or export.\n4. Keep DRY_RUN = true in **Validate and Prepare People** until both credentials are tested.\n5. This template caps each request at 10 people and serializes requests. NeverBounce recommends its Jobs API for existing lists or bulk databases; use this single-check design only for low-volume, user-triggered qualification, or replace it with a Jobs API workflow.\n6. Only the verified class is outreach_allowed by default. Catch-all, unknown, and role accounts require review; invalid and disposable addresses are suppressed.\n7. In Workflow Settings, select **JavedAI 99 - Central Error Handler** after import. No static workflow ID is embedded.\n8. The handoff contract for workflow 05 includes both canonical and compatibility fields: title/job_title, domain/company_domain, suppression_required/suppressed, and email_verified.\n\nExpected body: people array with full_name (or first_name/last_name), domain, optional LinkedIn/profile metadata, suppression flags, and outreach_basis_confirmed set to true.\n\nInactive on import; no credentials, contacts, or source-system data are included."
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-1180, -540],
+      "id": "00000000-0000-4004-8000-000000000001",
+      "name": "Setup Verification and Compliance Notes"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "javedai-email-find-and-verify",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [-1140, 0],
+      "id": "00000000-0000-4004-8000-000000000002",
+      "name": "Receive Person Records",
+      "webhookId": "00000000-0000-4004-9000-000000000002"
+    },
+    {
+      "parameters": {
+        "jsCode": "const webhook = $input.first()?.json || {};\nconst body = webhook.body && typeof webhook.body === 'object' ? webhook.body : {};\nconst headers = Object.fromEntries(Object.entries(webhook.headers || {}).map(([key, value]) => [String(key).toLowerCase(), value]));\nconst expectedKey = String($env.JAVEDAI_WORKFLOW_KEY || '').trim();\nconst presentedKey = String(headers['x-javedai-key'] || '').trim();\nconst DRY_RUN = true;\nfunction safeEqual(left, right) {\n  if (!left || !right || left.length !== right.length) return false;\n  let mismatch = 0;\n  for (let index = 0; index < left.length; index += 1) mismatch |= left.charCodeAt(index) ^ right.charCodeAt(index);\n  return mismatch === 0;\n}\nfunction clean(value, max = 300) { return String(value || '').replace(/[\\u0000-\\u001F\\u007F]/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, max); }\nfunction normalizeDomain(value) {\n  const raw = clean(value, 300).toLowerCase();\n  if (!raw) return '';\n  try { return new URL(raw.includes('://') ? raw : 'https://' + raw).hostname.replace(/^www\\./, ''); } catch { return ''; }\n}\nconst responseEnvelope = body.response && typeof body.response === 'object' ? body.response : {};\nconst rawPeople = Array.isArray(body.people) ? body.people : Array.isArray(body.decision_makers) ? body.decision_makers : Array.isArray(responseEnvelope.decision_makers) ? responseEnvelope.decision_makers : Array.isArray(responseEnvelope.people) ? responseEnvelope.people : [body.person || body];\nconst seen = new Set();\nconst people = rawPeople.map((raw) => {\n  const person = raw && typeof raw === 'object' ? raw : {};\n  const firstName = clean(person.first_name, 80);\n  const lastName = clean(person.last_name, 80);\n  const fullName = clean(person.full_name || person.name || [firstName, lastName].filter(Boolean).join(' '), 180);\n  const domain = normalizeDomain(person.domain || person.website || person.company_website);\n  const suppressed = person.suppression_required === true || person.unsubscribed === true || person.do_not_contact === true;\n  return { person_id: clean(person.person_id || person.id, 120), first_name: firstName, last_name: lastName, full_name: fullName, title: clean(person.title, 180), linkedin_url: clean(person.linkedin_url || person.profile_url, 400), company_id: clean(person.company_id, 120), company_name: clean(person.company_name || person.company, 180), domain, source: clean(person.source || 'decision_maker_discovery', 80), existing_email: clean(person.email, 254).toLowerCase(), suppression_required: suppressed };\n}).filter((person) => {\n  const key = person.person_id || person.linkedin_url || (person.full_name + '|' + person.domain).toLowerCase();\n  if (!person.full_name || !person.domain || !key || seen.has(key)) return false;\n  seen.add(key);\n  person.dedupe_key = key;\n  return true;\n}).slice(0, 10);\nconst basisConfirmed = body.outreach_basis_confirmed === true || String(body.outreach_basis_confirmed || '').toLowerCase() === 'true';\nconst errors = [];\nif (!expectedKey) errors.push('server_auth_not_configured');\nif (!safeEqual(presentedKey, expectedKey)) errors.push('unauthorized');\nif (!basisConfirmed) errors.push('outreach_basis_confirmation_required');\nif (people.length === 0) errors.push('at_least_one_valid_person_and_domain_required');\nreturn [{ json: { auth_valid: safeEqual(presentedKey, expectedKey), valid: errors.length === 0, errors, dry_run: DRY_RUN, request_id: clean(body.request_id, 120) || 'email-' + Date.now().toString(36), input_person_count: rawPeople.length, unique_person_count: people.length, people } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-900, 0],
+      "id": "00000000-0000-4004-8000-000000000003",
+      "name": "Validate and Prepare People"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 3},
+          "conditions": [{"id": "00000000-0000-4004-a000-000000000004", "leftValue": "={{ Boolean($json.auth_valid && $json.valid) }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [-660, 0],
+      "id": "00000000-0000-4004-8000-000000000004",
+      "name": "People Ready?"
+    },
+    {
+      "parameters": {"jsCode": "const data = $input.first().json;\nreturn [{ json: { response_code: data.auth_valid ? 400 : 401, response: { ok: false, status: data.auth_valid ? 'invalid_request' : 'unauthorized', request_id: data.request_id || null, errors: data.errors || ['invalid_request'] } } }];"},
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-420, 300],
+      "id": "00000000-0000-4004-8000-000000000005",
+      "name": "Build Invalid People Response"
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{ $json.response }}", "options": {"responseCode": "={{ $json.response_code }}"}},
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [-180, 300],
+      "id": "00000000-0000-4004-8000-000000000006",
+      "name": "Return Invalid People"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 3},
+          "conditions": [{"id": "00000000-0000-4004-a000-000000000007", "leftValue": "={{ $json.dry_run }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [-420, 0],
+      "id": "00000000-0000-4004-8000-000000000007",
+      "name": "Dry Run?"
+    },
+    {
+      "parameters": {"jsCode": "const data = $input.first().json;\nreturn [{ json: { response: { ok: true, status: 'validated_dry_run', dry_run: true, request_id: data.request_id, person_count: data.unique_person_count, verified_count: 0, risky_count: 0, rejected_count: 0, contacts: data.people.map((person) => ({ person_id: person.person_id, full_name: person.full_name, title: person.title, job_title: person.title, domain: person.domain, company_domain: person.domain, email_verified: false, classification: 'not_run', suppression_required: person.suppression_required, suppressed: person.suppression_required, outreach_allowed: false })), providers_skipped: ['anymail_finder', 'neverbounce'] } } }];"},
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-180, -180],
+      "id": "00000000-0000-4004-8000-000000000008",
+      "name": "Build Email Dry-Run Response"
+    },
+    {
+      "parameters": {"jsCode": "const data = $input.first().json;\nreturn data.people.map((person) => ({ json: { ...person, request_id: data.request_id } }));"},
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-180, 80],
+      "id": "00000000-0000-4004-8000-000000000009",
+      "name": "Emit Unique Person Items"
+    },
+    {
+      "parameters": {"batchSize": 1, "options": {}},
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [60, 80],
+      "id": "00000000-0000-4004-8000-000000000010",
+      "name": "Loop Over People"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 3},
+          "conditions": [{"id": "00000000-0000-4004-a000-000000000011", "leftValue": "={{ $json.suppression_required }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [300, 180],
+      "id": "00000000-0000-4004-8000-000000000011",
+      "name": "Already Suppressed?"
+    },
+    {
+      "parameters": {"jsCode": "const person = $input.first().json;\nreturn [{ json: { ...person, email: person.existing_email || '', finder_status: 'skipped_suppressed', verification_status: 'not_run', verification_flags: [], classification: 'rejected', classification_reason: 'pre_existing_suppression', suppression_required: true, outreach_allowed: false, manual_review_required: false } }];"},
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [540, 80],
+      "id": "00000000-0000-4004-8000-000000000012",
+      "name": "Classify Pre-Suppressed Contact"
+    },
+    {
+      "parameters": {"amount": 1},
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [540, 260],
+      "id": "00000000-0000-4004-8000-000000000013",
+      "name": "Pace Email Discovery",
+      "webhookId": "00000000-0000-4004-9000-000000000013"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.anymailfinder.com/v5.1/find-email/person",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "Accept", "value": "application/json"}, {"name": "Content-Type", "value": "application/json"}]},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ full_name: $json.full_name, domain: $json.domain }) }}",
+        "options": {"timeout": 20000}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [780, 260],
+      "id": "00000000-0000-4004-8000-000000000014",
+      "name": "Anymail Finder - Find Person Email",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "const finder = $input.first().json || {};\nconst person = $node['Loop Over People'].json;\nconst candidate = String(finder.email || person.existing_email || '').trim().toLowerCase();\nconst emailFound = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(candidate);\nreturn [{ json: { ...person, email: candidate, email_found: emailFound, finder_status: String(finder.email_status || (emailFound ? 'candidate' : 'not_found')), email_source: finder.email ? 'anymail_finder' : person.existing_email ? 'input_fallback' : 'none', finder_credits_charged: Number(finder.credits_charged || 0) } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1020, 260],
+      "id": "00000000-0000-4004-8000-000000000015",
+      "name": "Parse Anymail Result"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 3},
+          "conditions": [{"id": "00000000-0000-4004-a000-000000000016", "leftValue": "={{ $json.email_found }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [1260, 260],
+      "id": "00000000-0000-4004-8000-000000000016",
+      "name": "Email Found?"
+    },
+    {
+      "parameters": {"jsCode": "const person = $input.first().json;\nreturn [{ json: { ...person, verification_status: 'not_run', verification_flags: [], classification: 'rejected', classification_reason: 'email_not_found', suppression_required: true, outreach_allowed: false, manual_review_required: false } }];"},
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1500, 420],
+      "id": "00000000-0000-4004-8000-000000000017",
+      "name": "Classify Email Not Found"
+    },
+    {
+      "parameters": {"amount": 1},
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1500, 180],
+      "id": "00000000-0000-4004-8000-000000000018",
+      "name": "Pace Email Verification",
+      "webhookId": "00000000-0000-4004-9000-000000000018"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://api.neverbounce.com/v4.2/single/check",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpQueryAuth",
+        "sendQuery": true,
+        "queryParameters": {"parameters": [{"name": "email", "value": "={{ $json.email }}"}, {"name": "timeout", "value": "10"}]},
+        "options": {"timeout": 15000}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [1740, 180],
+      "id": "00000000-0000-4004-8000-000000000019",
+      "name": "NeverBounce - Verify Email",
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "const verification = $input.first().json || {};\nconst person = $node['Parse Anymail Result'].json;\nconst status = String(verification.result || 'unknown').toLowerCase();\nconst flags = Array.isArray(verification.flags) ? verification.flags.map(String) : [];\nconst localPart = String(person.email || '').split('@')[0].toLowerCase();\nconst roleAccount = flags.includes('role_account') || /^(admin|billing|contact|hello|info|office|sales|support|team)$/.test(localPart);\nlet classification = 'risky';\nlet reason = status;\nif (status === 'valid' && !roleAccount) classification = 'verified';\nelse if (status === 'invalid' || status === 'disposable') classification = 'rejected';\nelse if (status === 'valid' && roleAccount) reason = 'role_account';\nconst suppressed = person.suppression_required || classification === 'rejected';\nreturn [{ json: { ...person, verification_status: status, verification_flags: flags, suggested_correction: String(verification.suggested_correction || ''), classification, classification_reason: reason, suppression_required: suppressed, outreach_allowed: classification === 'verified' && !suppressed, manual_review_required: classification === 'risky', verification_provider: 'neverbounce' } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1980, 180],
+      "id": "00000000-0000-4004-8000-000000000020",
+      "name": "Classify Verification Result"
+    },
+    {
+      "parameters": {
+        "jsCode": "const context = $node['Validate and Prepare People'].json;\nconst contacts = $input.all().map((item) => item.json).map((person) => {\n  const classification = person.classification || 'rejected';\n  const suppressed = Boolean(person.suppression_required);\n  return { person_id: person.person_id || '', first_name: person.first_name || '', last_name: person.last_name || '', full_name: person.full_name || '', title: person.title || '', job_title: person.title || '', linkedin_url: person.linkedin_url || '', company_id: person.company_id || '', company_name: person.company_name || '', domain: person.domain || '', company_domain: person.domain || '', email: person.email || '', email_verified: classification === 'verified', email_source: person.email_source || 'none', finder_status: person.finder_status || 'not_run', verification_status: person.verification_status || 'not_run', verification_flags: person.verification_flags || [], classification, classification_reason: person.classification_reason || 'unclassified', suppression_required: suppressed, suppressed, outreach_allowed: Boolean(person.outreach_allowed), manual_review_required: Boolean(person.manual_review_required), source: person.source || 'decision_maker_discovery' };\n});\nconst byEmail = new Set();\nconst deduped = contacts.filter((contact) => {\n  const key = contact.email || (contact.full_name + '|' + contact.domain).toLowerCase();\n  if (!key || byEmail.has(key)) return false;\n  byEmail.add(key);\n  return true;\n});\nreturn [{ json: { response: { ok: true, status: 'complete', dry_run: false, request_id: context.request_id, contact_count: deduped.length, verified_count: deduped.filter((contact) => contact.email_verified).length, risky_count: deduped.filter((contact) => contact.classification === 'risky').length, rejected_count: deduped.filter((contact) => contact.classification === 'rejected').length, outreach_allowed_count: deduped.filter((contact) => contact.outreach_allowed).length, contacts: deduped } } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [300, -80],
+      "id": "00000000-0000-4004-8000-000000000021",
+      "name": "Package Canonical Contact Results"
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{ $json.response }}", "options": {"responseCode": 200}},
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [580, -140],
+      "id": "00000000-0000-4004-8000-000000000022",
+      "name": "Return Email Results"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Receive Person Records": {"main": [[{"node": "Validate and Prepare People", "type": "main", "index": 0}]]},
+    "Validate and Prepare People": {"main": [[{"node": "People Ready?", "type": "main", "index": 0}]]},
+    "People Ready?": {"main": [[{"node": "Dry Run?", "type": "main", "index": 0}], [{"node": "Build Invalid People Response", "type": "main", "index": 0}]]},
+    "Build Invalid People Response": {"main": [[{"node": "Return Invalid People", "type": "main", "index": 0}]]},
+    "Dry Run?": {"main": [[{"node": "Build Email Dry-Run Response", "type": "main", "index": 0}], [{"node": "Emit Unique Person Items", "type": "main", "index": 0}]]},
+    "Build Email Dry-Run Response": {"main": [[{"node": "Return Email Results", "type": "main", "index": 0}]]},
+    "Emit Unique Person Items": {"main": [[{"node": "Loop Over People", "type": "main", "index": 0}]]},
+    "Loop Over People": {"main": [[{"node": "Package Canonical Contact Results", "type": "main", "index": 0}], [{"node": "Already Suppressed?", "type": "main", "index": 0}]]},
+    "Already Suppressed?": {"main": [[{"node": "Classify Pre-Suppressed Contact", "type": "main", "index": 0}], [{"node": "Pace Email Discovery", "type": "main", "index": 0}]]},
+    "Classify Pre-Suppressed Contact": {"main": [[{"node": "Loop Over People", "type": "main", "index": 0}]]},
+    "Pace Email Discovery": {"main": [[{"node": "Anymail Finder - Find Person Email", "type": "main", "index": 0}]]},
+    "Anymail Finder - Find Person Email": {"main": [[{"node": "Parse Anymail Result", "type": "main", "index": 0}]]},
+    "Parse Anymail Result": {"main": [[{"node": "Email Found?", "type": "main", "index": 0}]]},
+    "Email Found?": {"main": [[{"node": "Pace Email Verification", "type": "main", "index": 0}], [{"node": "Classify Email Not Found", "type": "main", "index": 0}]]},
+    "Classify Email Not Found": {"main": [[{"node": "Loop Over People", "type": "main", "index": 0}]]},
+    "Pace Email Verification": {"main": [[{"node": "NeverBounce - Verify Email", "type": "main", "index": 0}]]},
+    "NeverBounce - Verify Email": {"main": [[{"node": "Classify Verification Result", "type": "main", "index": 0}]]},
+    "Classify Verification Result": {"main": [[{"node": "Loop Over People", "type": "main", "index": 0}]]},
+    "Package Canonical Contact Results": {"main": [[{"node": "Return Email Results", "type": "main", "index": 0}]]}
+  },
+  "active": false,
+  "settings": {"executionOrder": "v1", "timezone": "Europe/London"},
+  "versionId": "40000000-0000-4004-8000-000000000004",
+  "meta": {"templateCredsSetupCompleted": false},
+  "tags": []
+}

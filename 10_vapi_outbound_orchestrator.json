@@ -1,0 +1,591 @@
+{
+  "name": "JavedAI 10 - Vapi Outbound Orchestrator",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## SETUP REQUIRED — safe by default\n\nThis workflow is **inactive** and `dry_run` is `true`. It will not call Vapi until you deliberately edit **Build Safe Configuration**.\n\n1. Set `approved_contacts_url`, `vapi_assistant_id`, `vapi_phone_number_id`, and `analysis_webhook_url`.\n2. Attach an n8n **HTTP Header Auth** credential to **Fetch Approved Callable Contacts**, **Create Vapi Call**, **Get Vapi Call**, and **Forward Final Call to Analysis**. Use `Authorization: Bearer …` for Vapi and a separate shared secret for the analysis webhook. No credential is embedded here.\n3. The source must return only contacts explicitly approved for calling. Expected fields: `contact_ref`, `phone` (E.164), `status`, `outreach_permitted`, `consent_to_call`, `suppressed`, `do_not_call`, `timezone`, optional `hubspot_contact_id`.\n4. Keep the UK weekday 09:00–17:00 gate, suppression checks, and daily cap unless counsel approves a change. Confirm PECR/TCPA/GDPR and recording-consent requirements for every market.\n5. Vapi's current primary endpoint is `POST https://api.vapi.ai/call`. The final status poll uses `GET /call/{id}`; Vapi's end-of-call webhook remains the reliable completion path.\n6. Static workflow data provides a conservative single-workflow dedupe/cap. Replace it with transactional Postgres/Redis before parallel or multi-instance production use.\n\nDry-run uses a reserved fictional UK number and stores only masked/hashes in audit data.",
+        "height": 620,
+        "width": 920,
+        "color": 5
+      },
+      "id": "10000000-0000-4000-8000-000000000001",
+      "name": "Setup and Safety Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-1840, -760]
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 9,
+              "triggerAtMinute": 5
+            }
+          ]
+        }
+      },
+      "id": "10000000-0000-4000-8000-000000000002",
+      "name": "Weekday Campaign Schedule",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [-1760, -80]
+    },
+    {
+      "parameters": {},
+      "id": "10000000-0000-4000-8000-000000000003",
+      "name": "Manual Safe Test",
+      "type": "n8n-nodes-base.manualTrigger",
+      "typeVersion": 1,
+      "position": [-1760, 80]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const now = new Date();\nreturn [{\n  json: {\n    config: {\n      dry_run: true,\n      emergency_stop: false,\n      timezone: 'Europe/London',\n      calling_window_start_hour: 9,\n      calling_window_end_hour: 17,\n      daily_cap: 20,\n      batch_size: 1,\n      rate_limit_seconds: 3,\n      approved_contacts_url: 'https://replace.example/api/approved-callable-contacts',\n      vapi_base_url: 'https://api.vapi.ai',\n      vapi_assistant_id: '',\n      vapi_phone_number_id: '',\n      analysis_webhook_url: 'https://replace.example/webhook/javedai-vapi-post-call',\n      analysis_forwarding_enabled: true,\n      campaign_ref: 'javedai-portfolio-safe-demo'\n    },\n    triggered_at: now.toISOString()\n  }\n}];"
+      },
+      "id": "10000000-0000-4000-8000-000000000004",
+      "name": "Build Safe Configuration",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1520, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "10000000-0000-4000-8000-000000000005",
+              "leftValue": "={{ $json.config.dry_run ? 'dry-run' : 'live' }}",
+              "rightValue": "dry-run",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "10000000-0000-4000-8000-000000000006",
+      "name": "Dry Run Mode?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-1280, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const config = $input.first().json.config;\nreturn [{\n  json: {\n    config,\n    contact_ref: 'fictional-demo-contact',\n    phone: '+447700900000',\n    hubspot_contact_id: '',\n    status: 'approved',\n    outreach_permitted: true,\n    consent_to_call: true,\n    suppressed: false,\n    do_not_call: false,\n    timezone: 'Europe/London',\n    daily_call_count: 0,\n    source: 'built-in-dry-run-fixture'\n  }\n}];"
+      },
+      "id": "10000000-0000-4000-8000-000000000007",
+      "name": "Create Fictional Test Contact",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1040, -140]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.config.approved_contacts_url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            { "name": "status", "value": "approved" },
+            { "name": "callable", "value": "true" },
+            { "name": "suppressed", "value": "false" },
+            { "name": "limit", "value": "={{ $json.config.daily_cap }}" }
+          ]
+        },
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "10000000-0000-4000-8000-000000000008",
+      "name": "Fetch Approved Callable Contacts",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [-1040, 140],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const config = $node['Build Safe Configuration'].json.config;\nconst rawItems = $input.all().map((item) => item.json ?? {});\nconst contacts = [];\nfor (const raw of rawItems) {\n  if (Array.isArray(raw)) contacts.push(...raw);\n  else if (Array.isArray(raw.results)) contacts.push(...raw.results);\n  else if (Array.isArray(raw.contacts)) contacts.push(...raw.contacts);\n  else if (raw.contact_ref || raw.contact_id || raw.phone || raw.phone_number) contacts.push(raw);\n}\nif (contacts.length === 0) {\n  return [{ json: { config, no_contact: true, source: 'empty-contact-feed' } }];\n}\nreturn contacts.map((contact) => ({\n  json: {\n    config,\n    contact_ref: String(contact.contact_ref ?? contact.contact_id ?? contact.id ?? ''),\n    phone: String(contact.phone ?? contact.phone_number ?? ''),\n    hubspot_contact_id: String(contact.hubspot_contact_id ?? ''),\n    status: String(contact.status ?? '').toLowerCase(),\n    outreach_permitted: contact.outreach_permitted === true,\n    consent_to_call: contact.consent_to_call === true,\n    suppressed: contact.suppressed === true,\n    do_not_call: contact.do_not_call === true,\n    timezone: String(contact.timezone ?? 'Europe/London'),\n    daily_call_count: Number(contact.daily_call_count ?? 0),\n    next_call_at: contact.next_call_at ?? null,\n    source: String(contact.source ?? 'approved-contact-source')\n  }\n}));"
+      },
+      "id": "10000000-0000-4000-8000-000000000009",
+      "name": "Normalize Contact Feed",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-800, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const workflowState = $getWorkflowStaticData('global');\nworkflowState.outboundDailyReservations ??= {};\nworkflowState.outboundIdempotency ??= {};\nconst stableHash = (value) => {\n  let hash = 2166136261;\n  for (const character of String(value)) {\n    hash ^= character.charCodeAt(0);\n    hash = Math.imul(hash, 16777619);\n  }\n  return (hash >>> 0).toString(36);\n};\nconst output = [];\nfor (const item of $input.all()) {\n  const data = item.json;\n  const config = data.config;\n  const now = new Date();\n  const parts = Object.fromEntries(new Intl.DateTimeFormat('en-GB', {\n    timeZone: config.timezone, weekday: 'short', year: 'numeric', month: '2-digit', day: '2-digit', hour: '2-digit', hourCycle: 'h23'\n  }).formatToParts(now).filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]));\n  const dayKey = `${parts.year}-${parts.month}-${parts.day}`;\n  const weekdayAllowed = !['Sat', 'Sun'].includes(parts.weekday);\n  const localHour = Number(parts.hour);\n  const insideWindow = weekdayAllowed && localHour >= config.calling_window_start_hour && localHour < config.calling_window_end_hour;\n  const reasons = [];\n  const phone = String(data.phone ?? '').replace(/[\\s().-]/g, '');\n  if (data.no_contact) reasons.push('no-approved-contacts-returned');\n  if (config.emergency_stop) reasons.push('emergency-stop-enabled');\n  if (!['approved', 'call-approved'].includes(data.status)) reasons.push('contact-not-explicitly-approved');\n  if (!data.outreach_permitted) reasons.push('outreach-not-permitted');\n  if (!data.consent_to_call) reasons.push('call-consent-not-recorded');\n  if (data.suppressed || data.do_not_call) reasons.push('suppressed-or-do-not-call');\n  if (data.timezone !== config.timezone) reasons.push('timezone-not-approved-for-this-campaign');\n  if (!/^\\+44\\d{9,10}$/.test(phone)) reasons.push('invalid-or-non-uk-e164-number');\n  if (data.next_call_at && new Date(data.next_call_at).getTime() > now.getTime()) reasons.push('scheduled-for-later');\n  if (!config.dry_run && !insideWindow) reasons.push('outside-uk-weekday-calling-window');\n  const contactKey = data.contact_ref || stableHash(phone);\n  const idempotencyKey = `${config.campaign_ref}:${dayKey}:${contactKey}`;\n  if (workflowState.outboundIdempotency[idempotencyKey]) reasons.push('already-reserved-today');\n  let reservedCount = Math.max(Number(workflowState.outboundDailyReservations[dayKey] ?? 0), Number(data.daily_call_count ?? 0));\n  if (!config.dry_run && reservedCount >= config.daily_cap) reasons.push('daily-cap-reached');\n  const route = reasons.length === 0 ? 'call' : 'skip';\n  if (route === 'call' && !config.dry_run) {\n    workflowState.outboundIdempotency[idempotencyKey] = now.toISOString();\n    reservedCount += 1;\n    workflowState.outboundDailyReservations[dayKey] = reservedCount;\n  }\n  output.push({ json: {\n    ...data,\n    phone,\n    phone_hash: stableHash(phone),\n    idempotency_key: idempotencyKey,\n    route,\n    safety_reasons: reasons,\n    uk_local_day: parts.weekday,\n    uk_local_hour: localHour,\n    inside_calling_window: insideWindow,\n    reserved_daily_count: reservedCount,\n    checked_at: now.toISOString()\n  }});\n}\nreturn output;"
+      },
+      "id": "10000000-0000-4000-8000-000000000010",
+      "name": "Apply Legal Suppression Time and Cap Gates",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-560, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "10000000-0000-4000-8000-000000000011",
+              "leftValue": "={{ $json.route }}",
+              "rightValue": "call",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "10000000-0000-4000-8000-000000000012",
+      "name": "Eligible to Call?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-320, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const state = $getWorkflowStaticData('global');\nstate.outboundAudit ??= [];\nstate.outboundAudit.push({\n  at: new Date().toISOString(),\n  event: 'call-skipped',\n  contact_ref: $json.contact_ref || null,\n  phone_hash: $json.phone_hash || null,\n  reasons: $json.safety_reasons || []\n});\nstate.outboundAudit = state.outboundAudit.slice(-500);\nreturn [{ json: { status: 'skipped', contact_ref: $json.contact_ref || null, reasons: $json.safety_reasons || [] } }];"
+      },
+      "id": "10000000-0000-4000-8000-000000000013",
+      "name": "Persist Sanitized Skip Audit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-80, 220]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {
+          "reset": false
+        }
+      },
+      "id": "10000000-0000-4000-8000-000000000014",
+      "name": "Loop Approved Contacts One at a Time",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [-80, -40]
+    },
+    {
+      "parameters": {},
+      "id": "10000000-0000-4000-8000-000000000015",
+      "name": "Campaign Run Complete",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [160, -260]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const data = $json;\nconst config = data.config;\nconst missingConfiguration = !config.dry_run && (!config.vapi_assistant_id || !config.vapi_phone_number_id);\nif (missingConfiguration) {\n  return [{ json: { ...data, call_route: 'dry-run', safety_reasons: [...(data.safety_reasons || []), 'vapi-ids-not-configured-preview-only'] } }];\n}\nconst vapiRequest = {\n  assistantId: config.vapi_assistant_id,\n  phoneNumberId: config.vapi_phone_number_id,\n  customer: { number: data.phone },\n  name: config.campaign_ref.slice(0, 40),\n  assistantOverrides: {\n    variableValues: {\n      contact_ref: data.contact_ref,\n      hubspot_contact_id: data.hubspot_contact_id || '',\n      campaign_ref: config.campaign_ref,\n      idempotency_key: data.idempotency_key\n    }\n  }\n};\nreturn [{ json: { ...data, call_route: config.dry_run ? 'dry-run' : 'live', vapi_request: vapiRequest } }];"
+      },
+      "id": "10000000-0000-4000-8000-000000000016",
+      "name": "Prepare Minimal Vapi Call Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [160, 20]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "10000000-0000-4000-8000-000000000017",
+              "leftValue": "={{ $json.call_route }}",
+              "rightValue": "dry-run",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "10000000-0000-4000-8000-000000000018",
+      "name": "Preview Instead of Calling?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [400, 20]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const masked = $json.phone ? `${$json.phone.slice(0, 4)}…${$json.phone.slice(-3)}` : null;\nreturn [{ json: {\n  status: 'dry-run-preview',\n  contact_ref: $json.contact_ref,\n  masked_phone: masked,\n  phone_hash: $json.phone_hash,\n  idempotency_key: $json.idempotency_key,\n  would_post_to: `${$json.config.vapi_base_url}/call`,\n  safety_checks_passed: true,\n  generated_at: new Date().toISOString()\n} }];"
+      },
+      "id": "10000000-0000-4000-8000-000000000019",
+      "name": "Build Dry Run Preview",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, -120]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const state = $getWorkflowStaticData('global');\nstate.outboundAudit ??= [];\nstate.outboundAudit.push({ at: new Date().toISOString(), event: 'dry-run-preview', contact_ref: $json.contact_ref, phone_hash: $json.phone_hash });\nstate.outboundAudit = state.outboundAudit.slice(-500);\nreturn [{ json: $json }];"
+      },
+      "id": "10000000-0000-4000-8000-000000000020",
+      "name": "Persist Dry Run Audit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, -120]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.config.vapi_base_url + '/call' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.vapi_request) }}",
+        "options": {
+          "timeout": 20000
+        }
+      },
+      "id": "10000000-0000-4000-8000-000000000021",
+      "name": "Create Vapi Call",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 140],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const response = $json ?? {};\nconst requestContext = $node['Prepare Minimal Vapi Call Request'].json;\nconst callId = String(response.id ?? response.call?.id ?? '');\nreturn [{ json: {\n  config: requestContext.config,\n  contact_ref: requestContext.contact_ref,\n  hubspot_contact_id: requestContext.hubspot_contact_id,\n  phone_hash: requestContext.phone_hash,\n  idempotency_key: requestContext.idempotency_key,\n  call_id: callId,\n  call_status: String(response.status ?? (callId ? 'queued' : 'creation-failed')),\n  call_created: Boolean(callId),\n  created_at: new Date().toISOString(),\n  api_error: response.error?.message ?? response.message ?? null\n} }];"
+      },
+      "id": "10000000-0000-4000-8000-000000000022",
+      "name": "Normalize Call Creation Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 140]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const state = $getWorkflowStaticData('global');\nstate.outboundAudit ??= [];\nstate.outboundAudit.push({\n  at: new Date().toISOString(),\n  event: $json.call_created ? 'vapi-call-created' : 'vapi-call-creation-failed',\n  call_id: $json.call_id || null,\n  contact_ref: $json.contact_ref || null,\n  phone_hash: $json.phone_hash || null,\n  status: $json.call_status\n});\nstate.outboundAudit = state.outboundAudit.slice(-500);\nreturn [{ json: { ...$json, creation_route: $json.call_created ? 'created' : 'failed' } }];"
+      },
+      "id": "10000000-0000-4000-8000-000000000023",
+      "name": "Persist Call Creation Audit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1120, 140]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "10000000-0000-4000-8000-000000000024",
+              "leftValue": "={{ $json.creation_route }}",
+              "rightValue": "created",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "10000000-0000-4000-8000-000000000025",
+      "name": "Call Created?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1360, 140]
+    },
+    {
+      "parameters": {
+        "amount": 1,
+        "unit": "minutes"
+      },
+      "id": "10000000-0000-4000-8000-000000000026",
+      "name": "Wait Before One Status Poll",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [1600, 80]
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.config.vapi_base_url + '/call/' + $json.call_id }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "10000000-0000-4000-8000-000000000027",
+      "name": "Get Vapi Call",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1840, 80],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 3000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const response = $json ?? {};\nconst creation = $node['Persist Call Creation Audit'].json;\nconst artifact = response.artifact ?? {};\nconst status = String(response.status ?? creation.call_status ?? 'unknown');\nconst endedReason = String(response.endedReason ?? response.ended_reason ?? '');\nconst isFinal = status === 'ended' || Boolean(response.endedAt) || Boolean(endedReason);\nreturn [{ json: {\n  event_type: 'outbound-status-poll',\n  call_id: creation.call_id,\n  call_status: status,\n  ended_reason: endedReason || null,\n  started_at: response.startedAt ?? null,\n  ended_at: response.endedAt ?? null,\n  duration_seconds: Number(response.durationSeconds ?? 0),\n  transcript: artifact.transcript ?? null,\n  messages: Array.isArray(artifact.messages) ? artifact.messages : [],\n  recording_present: Boolean(artifact.recording),\n  contact_ref: creation.contact_ref,\n  hubspot_contact_id: creation.hubspot_contact_id,\n  phone_hash: creation.phone_hash,\n  idempotency_key: creation.idempotency_key,\n  config: creation.config,\n  final_route: isFinal ? 'final' : 'await-webhook',\n  observed_at: new Date().toISOString()\n} }];"
+      },
+      "id": "10000000-0000-4000-8000-000000000028",
+      "name": "Normalize Post Call Snapshot",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2080, 80]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "10000000-0000-4000-8000-000000000029",
+              "leftValue": "={{ $json.final_route }}",
+              "rightValue": "final",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "10000000-0000-4000-8000-000000000030",
+      "name": "Final Call Record Available?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [2320, 80]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.config.analysis_webhook_url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "10000000-0000-4000-8000-000000000031",
+      "name": "Forward Final Call to Analysis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2560, -20],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const snapshot = $node['Normalize Post Call Snapshot'].json;\nconst state = $getWorkflowStaticData('global');\nstate.outboundAudit ??= [];\nstate.outboundAudit.push({\n  at: new Date().toISOString(),\n  event: 'final-call-forward-attempted',\n  call_id: snapshot.call_id,\n  contact_ref: snapshot.contact_ref || null,\n  phone_hash: snapshot.phone_hash || null,\n  status: snapshot.call_status,\n  ended_reason: snapshot.ended_reason\n});\nstate.outboundAudit = state.outboundAudit.slice(-500);\nreturn [{ json: { call_id: snapshot.call_id, status: snapshot.call_status, analysis_forward_attempted: true } }];"
+      },
+      "id": "10000000-0000-4000-8000-000000000032",
+      "name": "Persist Final Call Audit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2800, -20]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const state = $getWorkflowStaticData('global');\nstate.outboundAudit ??= [];\nstate.outboundAudit.push({\n  at: new Date().toISOString(),\n  event: 'awaiting-vapi-end-of-call-webhook',\n  call_id: $json.call_id,\n  contact_ref: $json.contact_ref || null,\n  phone_hash: $json.phone_hash || null,\n  status: $json.call_status\n});\nstate.outboundAudit = state.outboundAudit.slice(-500);\nreturn [{ json: { call_id: $json.call_id, status: $json.call_status, awaiting_webhook: true } }];"
+      },
+      "id": "10000000-0000-4000-8000-000000000033",
+      "name": "Persist Awaiting Webhook Audit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2560, 200]
+    },
+    {
+      "parameters": {
+        "amount": 3
+      },
+      "id": "10000000-0000-4000-8000-000000000034",
+      "name": "Rate Limit Between Contacts",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [3040, 100]
+    }
+  ],
+  "connections": {
+    "Weekday Campaign Schedule": {
+      "main": [[{ "node": "Build Safe Configuration", "type": "main", "index": 0 }]]
+    },
+    "Manual Safe Test": {
+      "main": [[{ "node": "Build Safe Configuration", "type": "main", "index": 0 }]]
+    },
+    "Build Safe Configuration": {
+      "main": [[{ "node": "Dry Run Mode?", "type": "main", "index": 0 }]]
+    },
+    "Dry Run Mode?": {
+      "main": [
+        [{ "node": "Create Fictional Test Contact", "type": "main", "index": 0 }],
+        [{ "node": "Fetch Approved Callable Contacts", "type": "main", "index": 0 }]
+      ]
+    },
+    "Create Fictional Test Contact": {
+      "main": [[{ "node": "Normalize Contact Feed", "type": "main", "index": 0 }]]
+    },
+    "Fetch Approved Callable Contacts": {
+      "main": [[{ "node": "Normalize Contact Feed", "type": "main", "index": 0 }]]
+    },
+    "Normalize Contact Feed": {
+      "main": [[{ "node": "Apply Legal Suppression Time and Cap Gates", "type": "main", "index": 0 }]]
+    },
+    "Apply Legal Suppression Time and Cap Gates": {
+      "main": [[{ "node": "Eligible to Call?", "type": "main", "index": 0 }]]
+    },
+    "Eligible to Call?": {
+      "main": [
+        [{ "node": "Loop Approved Contacts One at a Time", "type": "main", "index": 0 }],
+        [{ "node": "Persist Sanitized Skip Audit", "type": "main", "index": 0 }]
+      ]
+    },
+    "Loop Approved Contacts One at a Time": {
+      "main": [
+        [{ "node": "Campaign Run Complete", "type": "main", "index": 0 }],
+        [{ "node": "Prepare Minimal Vapi Call Request", "type": "main", "index": 0 }]
+      ]
+    },
+    "Prepare Minimal Vapi Call Request": {
+      "main": [[{ "node": "Preview Instead of Calling?", "type": "main", "index": 0 }]]
+    },
+    "Preview Instead of Calling?": {
+      "main": [
+        [{ "node": "Build Dry Run Preview", "type": "main", "index": 0 }],
+        [{ "node": "Create Vapi Call", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build Dry Run Preview": {
+      "main": [[{ "node": "Persist Dry Run Audit", "type": "main", "index": 0 }]]
+    },
+    "Persist Dry Run Audit": {
+      "main": [[{ "node": "Rate Limit Between Contacts", "type": "main", "index": 0 }]]
+    },
+    "Create Vapi Call": {
+      "main": [[{ "node": "Normalize Call Creation Result", "type": "main", "index": 0 }]]
+    },
+    "Normalize Call Creation Result": {
+      "main": [[{ "node": "Persist Call Creation Audit", "type": "main", "index": 0 }]]
+    },
+    "Persist Call Creation Audit": {
+      "main": [[{ "node": "Call Created?", "type": "main", "index": 0 }]]
+    },
+    "Call Created?": {
+      "main": [
+        [{ "node": "Wait Before One Status Poll", "type": "main", "index": 0 }],
+        [{ "node": "Rate Limit Between Contacts", "type": "main", "index": 0 }]
+      ]
+    },
+    "Wait Before One Status Poll": {
+      "main": [[{ "node": "Get Vapi Call", "type": "main", "index": 0 }]]
+    },
+    "Get Vapi Call": {
+      "main": [[{ "node": "Normalize Post Call Snapshot", "type": "main", "index": 0 }]]
+    },
+    "Normalize Post Call Snapshot": {
+      "main": [[{ "node": "Final Call Record Available?", "type": "main", "index": 0 }]]
+    },
+    "Final Call Record Available?": {
+      "main": [
+        [{ "node": "Forward Final Call to Analysis", "type": "main", "index": 0 }],
+        [{ "node": "Persist Awaiting Webhook Audit", "type": "main", "index": 0 }]
+      ]
+    },
+    "Forward Final Call to Analysis": {
+      "main": [[{ "node": "Persist Final Call Audit", "type": "main", "index": 0 }]]
+    },
+    "Persist Final Call Audit": {
+      "main": [[{ "node": "Rate Limit Between Contacts", "type": "main", "index": 0 }]]
+    },
+    "Persist Awaiting Webhook Audit": {
+      "main": [[{ "node": "Rate Limit Between Contacts", "type": "main", "index": 0 }]]
+    },
+    "Rate Limit Between Contacts": {
+      "main": [[{ "node": "Loop Approved Contacts One at a Time", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/London",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none"
+  },
+  "versionId": "10000000-0000-4000-8000-00000000f010",
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "portfolioTemplate": true,
+    "sanitized": true
+  },
+  "tags": []
+}

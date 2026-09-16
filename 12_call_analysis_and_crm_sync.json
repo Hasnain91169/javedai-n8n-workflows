@@ -1,0 +1,444 @@
+{
+  "name": "JavedAI 12 - Call Analysis and CRM Sync",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## SETUP REQUIRED — shared post-call processor\n\nThis workflow is **inactive** and all external writes are disabled. It accepts a normalized final call record from workflows 10/11 or a raw Vapi `end-of-call-report`.\n\n1. Attach an n8n **Header Auth** credential to **Post Call Analysis Webhook** and use the same secret in callers.\n2. Keep `llm_enabled`, `crm_enabled`, and `metrics_sink_enabled` false until their URLs and credentials are configured in **Validate Redact and Deduplicate**.\n3. If enabling the optional LLM HTTP node, attach a provider-specific Header Auth credential. The prompt requests JSON only; **Safely Parse LLM Result** validates and falls back to deterministic analysis.\n4. Attach a HubSpot private-app Header Auth credential (`Authorization: Bearer …`) to both HubSpot nodes. Create or remap these contact properties first: `javedai_last_call_outcome`, `javedai_last_call_summary`, `javedai_last_call_at`, `javedai_last_vapi_call_id`.\n5. HubSpot contact update uses `PATCH /crm/v3/objects/contacts/{contactId}`. Note creation uses `POST /crm/v3/objects/notes` and the HubSpot-defined note-to-contact association type 202.\n6. The workflow redacts email addresses, phone-like strings and payment-card-like digit runs, limits transcript size, never stores recording URLs, and keeps only a bounded sanitized audit. Review consent and retention before production.\n7. Static workflow data supplies basic idempotency. Use a transactional database/queue when running concurrent workers.\n\nOfficial HubSpot references: https://developers.hubspot.com/docs/api/crm/contacts and https://developers.hubspot.com/docs/api/crm/notes",
+        "height": 650,
+        "width": 980,
+        "color": 5
+      },
+      "id": "12000000-0000-4000-8000-000000000001",
+      "name": "Setup Privacy LLM and HubSpot Notes",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-1520, -700]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "javedai-vapi-post-call",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "12000000-0000-4000-8000-000000000002",
+      "name": "Post Call Analysis Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [-1440, 0],
+      "webhookId": "12000000-0000-4000-8000-00000000b012"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const envelope = $input.first()?.json ?? {};\nconst payload = envelope.body ?? envelope;\nconst message = payload.message ?? {};\nconst call = payload.call ?? message.call ?? {};\nconst artifact = payload.artifact ?? message.artifact ?? call.artifact ?? {};\nconst variables = artifact.variableValues ?? message.variableValues ?? call.assistantOverrides?.variableValues ?? {};\nconst config = {\n  max_transcript_characters: 12000,\n  llm_enabled: false,\n  llm_endpoint: 'https://replace.example/v1/structured-call-analysis',\n  llm_model: 'configure-in-provider',\n  crm_enabled: false,\n  hubspot_base_url: 'https://api.hubapi.com',\n  metrics_sink_enabled: false,\n  metrics_sink_url: 'https://replace.example/api/call-metrics'\n};\nconst redact = (value) => String(value ?? '')\n  .replace(/[A-Z0-9._%+-]+@[A-Z0-9.-]+\\.[A-Z]{2,}/gi, '[EMAIL_REDACTED]')\n  .replace(/\\+?\\d[\\d\\s().-]{7,}\\d/g, '[PHONE_REDACTED]')\n  .replace(/\\b(?:\\d[ -]*?){13,19}\\b/g, '[NUMBER_REDACTED]');\nconst stableHash = (value) => {\n  let hash = 2166136261;\n  for (const character of String(value ?? '')) {\n    hash ^= character.charCodeAt(0);\n    hash = Math.imul(hash, 16777619);\n  }\n  return value ? (hash >>> 0).toString(36) : null;\n};\nconst callId = String(payload.call_id ?? call.id ?? message.callId ?? '');\nconst eventType = String(payload.event_type ?? message.type ?? 'post-call');\nconst callStatus = String(payload.call_status ?? message.status ?? call.status ?? 'ended');\nconst endedReason = String(payload.ended_reason ?? message.endedReason ?? call.endedReason ?? '');\nconst transcript = redact(payload.transcript ?? artifact.transcript ?? '').slice(0, config.max_transcript_characters);\nconst sourceMessages = Array.isArray(payload.messages) ? payload.messages : (Array.isArray(artifact.messages) ? artifact.messages : []);\nconst messages = sourceMessages.slice(-100).map((entry) => ({\n  role: ['assistant', 'user', 'system'].includes(entry.role) ? entry.role : 'unknown',\n  message: redact(entry.message ?? entry.content ?? '').slice(0, 2000)\n}));\nconst startedAt = payload.started_at ?? call.startedAt ?? null;\nconst endedAt = payload.ended_at ?? call.endedAt ?? null;\nconst durationSeconds = Number(payload.duration_seconds ?? call.durationSeconds ?? 0);\nconst callerHash = payload.caller_hash ?? stableHash(call.customer?.number ?? message.customer?.number ?? '');\nconst contactRef = String(payload.contact_ref ?? variables.contact_ref ?? '');\nconst hubspotContactId = String(payload.hubspot_contact_id ?? variables.hubspot_contact_id ?? '');\nconst state = $getWorkflowStaticData('global');\nstate.processedPostCalls ??= {};\nconst duplicate = Boolean(callId && state.processedPostCalls[callId]);\nconst finalSignal = eventType === 'end-of-call-report' || eventType === 'outbound-status-poll' || callStatus === 'ended' || Boolean(endedAt) || Boolean(endedReason);\nconst valid = Boolean(callId && finalSignal);\nconst processRoute = !valid ? 'invalid' : (duplicate ? 'duplicate' : 'process');\nreturn [{ json: {\n  config,\n  valid,\n  duplicate,\n  process_route: processRoute,\n  validation_errors: [!callId ? 'missing-call-id' : null, !finalSignal ? 'not-a-final-call-record' : null].filter(Boolean),\n  event_type: eventType,\n  call_id: callId,\n  call_status: callStatus,\n  call_direction: String(payload.call_direction ?? call.type ?? 'unknown'),\n  ended_reason: endedReason || null,\n  started_at: startedAt,\n  ended_at: endedAt,\n  duration_seconds: durationSeconds,\n  transcript,\n  messages,\n  recording_present: Boolean(payload.recording_present ?? artifact.recording),\n  caller_hash: callerHash,\n  contact_ref: contactRef || null,\n  hubspot_contact_id: hubspotContactId || null,\n  received_at: new Date().toISOString()\n} }];"
+      },
+      "id": "12000000-0000-4000-8000-000000000003",
+      "name": "Validate Redact and Deduplicate",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1200, 0]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ { accepted: $json.valid, duplicate: $json.duplicate, callId: $json.call_id || null, errors: $json.validation_errors } }}",
+        "options": {
+          "responseCode": "={{ $json.valid ? 202 : 400 }}"
+        }
+      },
+      "id": "12000000-0000-4000-8000-000000000004",
+      "name": "Acknowledge Post Call Payload",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [-960, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "return [{ json: $node['Validate Redact and Deduplicate'].json }];"
+      },
+      "id": "12000000-0000-4000-8000-000000000005",
+      "name": "Continue With Validated Call",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-720, 0]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "12000000-0000-4000-8000-000000000006",
+              "leftValue": "={{ $json.process_route }}",
+              "rightValue": "process",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "12000000-0000-4000-8000-000000000007",
+      "name": "New Valid Final Call?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [-480, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const state = $getWorkflowStaticData('global');\nstate.postCallAudit ??= [];\nstate.postCallAudit.push({\n  at: new Date().toISOString(),\n  event: $json.duplicate ? 'duplicate-post-call-ignored' : 'invalid-post-call-rejected',\n  call_id: $json.call_id || null,\n  caller_hash: $json.caller_hash || null,\n  errors: $json.validation_errors || []\n});\nstate.postCallAudit = state.postCallAudit.slice(-500);\nreturn [{ json: { processed: false, route: $json.process_route, call_id: $json.call_id || null } }];"
+      },
+      "id": "12000000-0000-4000-8000-000000000008",
+      "name": "Persist Rejected or Duplicate Audit",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-240, 220]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const messages = Array.isArray($json.messages) ? $json.messages : [];\nconst userTurns = messages.filter((entry) => entry.role === 'user').length;\nconst assistantTurns = messages.filter((entry) => entry.role === 'assistant').length;\nconst transcript = String($json.transcript ?? '');\nconst lower = transcript.toLowerCase();\nlet duration = Number($json.duration_seconds ?? 0);\nif (!duration && $json.started_at && $json.ended_at) {\n  duration = Math.max(0, Math.round((new Date($json.ended_at).getTime() - new Date($json.started_at).getTime()) / 1000));\n}\nlet outcome = 'unknown';\nif (($json.ended_reason || '').toLowerCase().includes('voicemail') || /leave (?:a )?message|after the tone|voicemail/.test(lower)) outcome = 'voicemail';\nelse if (/appointment (?:is )?(?:booked|confirmed)|meeting (?:is )?(?:booked|confirmed)|scheduled for/.test(lower)) outcome = 'booked';\nelse if (/call (?:me|us) back|callback|try again (?:later|tomorrow)/.test(lower)) outcome = 'callback-requested';\nelse if (/not interested|do not call|remove me|stop calling/.test(lower)) outcome = 'not-interested';\nelse if (transcript.length > 0) outcome = 'completed';\nconst summarySource = transcript.replace(/\\s+/g, ' ').trim();\nconst fallbackSummary = summarySource ? `${summarySource.slice(0, 420)}${summarySource.length > 420 ? '…' : ''}` : `Call ended with status ${$json.call_status}.`;\nconst actionMap = {\n  booked: ['Confirm the appointment details and owner.'],\n  'callback-requested': ['Create a time-bound callback task.'],\n  'not-interested': ['Apply the appropriate suppression or nurture status.'],\n  voicemail: ['Follow the approved voicemail follow-up policy.'],\n  completed: ['Review the summary and assign the next owner.'],\n  unknown: ['Review the call record manually.']\n};\nconst deterministicAnalysis = {\n  outcome,\n  summary: fallbackSummary,\n  action_items: actionMap[outcome] ?? actionMap.unknown,\n  confidence: outcome === 'unknown' ? 0.25 : 0.65\n};\nreturn [{ json: {\n  ...$json,\n  duration_seconds: duration,\n  user_turn_count: userTurns,\n  assistant_turn_count: assistantTurns,\n  total_turn_count: userTurns + assistantTurns,\n  deterministic_analysis: deterministicAnalysis,\n  analysis_route: $json.config.llm_enabled && transcript.length > 0 ? 'llm' : 'deterministic'\n} }];"
+      },
+      "id": "12000000-0000-4000-8000-000000000009",
+      "name": "Compute Deterministic Call Metrics",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-240, -80]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "12000000-0000-4000-8000-000000000010",
+              "leftValue": "={{ $json.analysis_route }}",
+              "rightValue": "llm",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "12000000-0000-4000-8000-000000000011",
+      "name": "Use Optional LLM?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [0, -80]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.config.llm_endpoint }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: $json.config.llm_model, instruction: 'Return only a JSON object. Do not infer identity. Allowed outcome values: booked, callback-requested, not-interested, voicemail, completed, unknown. Keep summary under 500 characters and action_items to at most five short strings.', transcript: $json.transcript, deterministic_metrics: { duration_seconds: $json.duration_seconds, user_turn_count: $json.user_turn_count, assistant_turn_count: $json.assistant_turn_count, ended_reason: $json.ended_reason }, output_schema: { outcome: 'allowed enum', summary: 'string', action_items: ['string'], confidence: 'number from 0 to 1' } }) }}",
+        "options": {
+          "timeout": 25000
+        }
+      },
+      "id": "12000000-0000-4000-8000-000000000012",
+      "name": "Request Structured LLM Analysis",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [240, -180],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const base = $node['Compute Deterministic Call Metrics'].json;\nconst response = $json ?? {};\nlet candidate = response.output_text ?? response.data?.output ?? response.result ?? response.choices?.[0]?.message?.content ?? null;\nif (candidate && typeof candidate === 'object') candidate = candidate;\nelse if (typeof candidate === 'string') {\n  const cleaned = candidate.trim().replace(/^```(?:json)?/i, '').replace(/```$/, '').trim();\n  try { candidate = JSON.parse(cleaned); } catch { candidate = null; }\n}\nconst allowed = new Set(['booked', 'callback-requested', 'not-interested', 'voicemail', 'completed', 'unknown']);\nconst valid = candidate && typeof candidate === 'object' && allowed.has(candidate.outcome) && typeof candidate.summary === 'string';\nconst analysis = valid ? {\n  outcome: candidate.outcome,\n  summary: candidate.summary.replace(/\\s+/g, ' ').trim().slice(0, 500),\n  action_items: Array.isArray(candidate.action_items) ? candidate.action_items.filter((value) => typeof value === 'string').slice(0, 5).map((value) => value.slice(0, 180)) : [],\n  confidence: Math.max(0, Math.min(1, Number(candidate.confidence ?? 0.5)))\n} : base.deterministic_analysis;\nreturn [{ json: { ...base, analysis, llm_used: Boolean(valid), llm_parse_fallback: !valid } }];"
+      },
+      "id": "12000000-0000-4000-8000-000000000013",
+      "name": "Safely Parse LLM Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [480, -180]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "return [{ json: { ...$json, analysis: $json.deterministic_analysis, llm_used: false, llm_parse_fallback: false } }];"
+      },
+      "id": "12000000-0000-4000-8000-000000000014",
+      "name": "Use Deterministic Analysis",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [240, 20]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "const analysis = $json.analysis ?? $json.deterministic_analysis;\nconst endedAt = $json.ended_at ?? $json.received_at;\nconst actionLines = (analysis.action_items || []).map((item) => `- ${item}`).join('\\n') || '- Manual review';\nconst noteText = [\n  'JavedAI voice call result',\n  `Outcome: ${analysis.outcome}`,\n  `Duration: ${$json.duration_seconds} seconds`,\n  `Summary: ${analysis.summary}`,\n  'Next actions:',\n  actionLines,\n  `Vapi call ID: ${$json.call_id}`\n].join('\\n');\nconst hubspotContactUpdateBody = { properties: {\n  javedai_last_call_outcome: analysis.outcome,\n  javedai_last_call_summary: analysis.summary,\n  javedai_last_call_at: endedAt,\n  javedai_last_vapi_call_id: $json.call_id\n} };\nconst hubspotNoteBody = {\n  properties: { hs_timestamp: endedAt, hs_note_body: noteText },\n  associations: [{\n    to: { id: $json.hubspot_contact_id },\n    types: [{ associationCategory: 'HUBSPOT_DEFINED', associationTypeId: 202 }]\n  }]\n};\nconst metricEvent = {\n  event: 'call-analysis-completed',\n  at: new Date().toISOString(),\n  call_id: $json.call_id,\n  direction: $json.call_direction,\n  status: $json.call_status,\n  ended_reason: $json.ended_reason,\n  outcome: analysis.outcome,\n  confidence: analysis.confidence,\n  duration_seconds: $json.duration_seconds,\n  user_turn_count: $json.user_turn_count,\n  assistant_turn_count: $json.assistant_turn_count,\n  total_turn_count: $json.total_turn_count,\n  recording_present: $json.recording_present,\n  caller_hash: $json.caller_hash,\n  contact_ref: $json.contact_ref,\n  llm_used: $json.llm_used\n};\nreturn [{ json: {\n  ...$json,\n  hubspot_contact_update_body: hubspotContactUpdateBody,\n  hubspot_note_body: hubspotNoteBody,\n  metric_event: metricEvent,\n  crm_route: $json.config.crm_enabled && Boolean($json.hubspot_contact_id) ? 'update' : 'skip'\n} }];"
+      },
+      "id": "12000000-0000-4000-8000-000000000015",
+      "name": "Build CRM and Metric Payload",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [720, -80]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "12000000-0000-4000-8000-000000000016",
+              "leftValue": "={{ $json.crm_route }}",
+              "rightValue": "update",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "12000000-0000-4000-8000-000000000017",
+      "name": "CRM Sync Enabled and Contact Known?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [960, -80]
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "={{ $json.config.hubspot_base_url + '/crm/v3/objects/contacts/' + encodeURIComponent($json.hubspot_contact_id) }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.hubspot_contact_update_body) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "12000000-0000-4000-8000-000000000018",
+      "name": "Update HubSpot Contact",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1200, -180],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $node['Build CRM and Metric Payload'].json.config.hubspot_base_url + '/crm/v3/objects/notes' }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($node['Build CRM and Metric Payload'].json.hubspot_note_body) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "12000000-0000-4000-8000-000000000019",
+      "name": "Create HubSpot Call Note",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1440, -180],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const base = $node['Build CRM and Metric Payload'].json;\nreturn [{ json: {\n  config: base.config,\n  call_id: base.call_id,\n  caller_hash: base.caller_hash,\n  metric_event: { ...base.metric_event, crm_attempted: base.crm_route === 'update' },\n  metrics_route: base.config.metrics_sink_enabled ? 'send' : 'local-only'\n} }];"
+      },
+      "id": "12000000-0000-4000-8000-000000000020",
+      "name": "Finalize Sanitized Metric Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1680, -80]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "12000000-0000-4000-8000-000000000021",
+              "leftValue": "={{ $json.metrics_route }}",
+              "rightValue": "send",
+              "operator": {
+                "type": "string",
+                "operation": "equals",
+                "name": "filter.operator.equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "12000000-0000-4000-8000-000000000022",
+      "name": "External Metrics Sink Enabled?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1920, -80]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.config.metrics_sink_url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.metric_event) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "12000000-0000-4000-8000-000000000023",
+      "name": "Write External Metric Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2160, -180],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForAllItems",
+        "jsCode": "const metricRecord = $node['Finalize Sanitized Metric Event'].json;\nconst state = $getWorkflowStaticData('global');\nstate.processedPostCalls ??= {};\nstate.postCallAudit ??= [];\nstate.processedPostCalls[metricRecord.call_id] = new Date().toISOString();\nstate.postCallAudit.push(metricRecord.metric_event);\nstate.postCallAudit = state.postCallAudit.slice(-500);\nconst cutoff = Date.now() - (35 * 24 * 60 * 60 * 1000);\nfor (const [callId, timestamp] of Object.entries(state.processedPostCalls)) {\n  if (new Date(timestamp).getTime() < cutoff) delete state.processedPostCalls[callId];\n}\nreturn [{ json: { processed: true, call_id: metricRecord.call_id, outcome: metricRecord.metric_event.outcome, metrics_external: metricRecord.metrics_route === 'send' } }];"
+      },
+      "id": "12000000-0000-4000-8000-000000000024",
+      "name": "Persist Bounded Audit and Idempotency",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2400, -80]
+    }
+  ],
+  "connections": {
+    "Post Call Analysis Webhook": {
+      "main": [[{ "node": "Validate Redact and Deduplicate", "type": "main", "index": 0 }]]
+    },
+    "Validate Redact and Deduplicate": {
+      "main": [[{ "node": "Acknowledge Post Call Payload", "type": "main", "index": 0 }]]
+    },
+    "Acknowledge Post Call Payload": {
+      "main": [[{ "node": "Continue With Validated Call", "type": "main", "index": 0 }]]
+    },
+    "Continue With Validated Call": {
+      "main": [[{ "node": "New Valid Final Call?", "type": "main", "index": 0 }]]
+    },
+    "New Valid Final Call?": {
+      "main": [
+        [{ "node": "Compute Deterministic Call Metrics", "type": "main", "index": 0 }],
+        [{ "node": "Persist Rejected or Duplicate Audit", "type": "main", "index": 0 }]
+      ]
+    },
+    "Compute Deterministic Call Metrics": {
+      "main": [[{ "node": "Use Optional LLM?", "type": "main", "index": 0 }]]
+    },
+    "Use Optional LLM?": {
+      "main": [
+        [{ "node": "Request Structured LLM Analysis", "type": "main", "index": 0 }],
+        [{ "node": "Use Deterministic Analysis", "type": "main", "index": 0 }]
+      ]
+    },
+    "Request Structured LLM Analysis": {
+      "main": [[{ "node": "Safely Parse LLM Result", "type": "main", "index": 0 }]]
+    },
+    "Safely Parse LLM Result": {
+      "main": [[{ "node": "Build CRM and Metric Payload", "type": "main", "index": 0 }]]
+    },
+    "Use Deterministic Analysis": {
+      "main": [[{ "node": "Build CRM and Metric Payload", "type": "main", "index": 0 }]]
+    },
+    "Build CRM and Metric Payload": {
+      "main": [[{ "node": "CRM Sync Enabled and Contact Known?", "type": "main", "index": 0 }]]
+    },
+    "CRM Sync Enabled and Contact Known?": {
+      "main": [
+        [{ "node": "Update HubSpot Contact", "type": "main", "index": 0 }],
+        [{ "node": "Finalize Sanitized Metric Event", "type": "main", "index": 0 }]
+      ]
+    },
+    "Update HubSpot Contact": {
+      "main": [[{ "node": "Create HubSpot Call Note", "type": "main", "index": 0 }]]
+    },
+    "Create HubSpot Call Note": {
+      "main": [[{ "node": "Finalize Sanitized Metric Event", "type": "main", "index": 0 }]]
+    },
+    "Finalize Sanitized Metric Event": {
+      "main": [[{ "node": "External Metrics Sink Enabled?", "type": "main", "index": 0 }]]
+    },
+    "External Metrics Sink Enabled?": {
+      "main": [
+        [{ "node": "Write External Metric Event", "type": "main", "index": 0 }],
+        [{ "node": "Persist Bounded Audit and Idempotency", "type": "main", "index": 0 }]
+      ]
+    },
+    "Write External Metric Event": {
+      "main": [[{ "node": "Persist Bounded Audit and Idempotency", "type": "main", "index": 0 }]]
+    }
+  },
+  "pinData": {},
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/London",
+    "saveManualExecutions": true,
+    "saveExecutionProgress": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "none"
+  },
+  "versionId": "12000000-0000-4000-8000-00000000f012",
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "portfolioTemplate": true,
+    "sanitized": true
+  },
+  "tags": []
+}

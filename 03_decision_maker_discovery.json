@@ -1,0 +1,202 @@
+{
+  "name": "JavedAI 03 - Decision-Maker Discovery",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## SETUP REQUIRED\n\nPurpose: accept company/domain records, call Apollo People API Search one company at a time, and return ranked decision-maker profiles for the email-discovery workflow.\n\n1. Create server environment variable JAVEDAI_WORKFLOW_KEY and send it in the x-javedai-key header.\n2. On **Apollo - Search People**, select a Header Auth credential with header name x-api-key and your Apollo API key as its value.\n3. Keep DRY_RUN = true in **Validate and Prepare Companies** until the credential and request limits are tested.\n4. This workflow intentionally does not claim Apollo search returns email addresses. Send its canonical people output to workflow 04 for email discovery and verification.\n5. The input is capped at 10 unique domains, the Apollo result count at 10 people per company, and requests are serialized with a wait node.\n6. In Workflow Settings, select **JavedAI 99 - Central Error Handler** after import. No static workflow ID is embedded.\n\nExpected body: companies array (each with domain or website and optional company_name), people_limit_per_company, and outreach_basis_confirmed set to true.\n\nInactive on import; no credentials, personal records, or client data are included."
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-1100, -500],
+      "id": "00000000-0000-4003-8000-000000000001",
+      "name": "Setup Compliance and Handoff Notes"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "javedai-decision-maker-discovery",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [-1060, 0],
+      "id": "00000000-0000-4003-8000-000000000002",
+      "name": "Receive Company Records",
+      "webhookId": "00000000-0000-4003-9000-000000000002"
+    },
+    {
+      "parameters": {
+        "jsCode": "const webhook = $input.first()?.json || {};\nconst body = webhook.body && typeof webhook.body === 'object' ? webhook.body : {};\nconst headers = Object.fromEntries(Object.entries(webhook.headers || {}).map(([key, value]) => [String(key).toLowerCase(), value]));\nconst expectedKey = String($env.JAVEDAI_WORKFLOW_KEY || '').trim();\nconst presentedKey = String(headers['x-javedai-key'] || '').trim();\nconst DRY_RUN = true;\nfunction safeEqual(left, right) {\n  if (!left || !right || left.length !== right.length) return false;\n  let mismatch = 0;\n  for (let index = 0; index < left.length; index += 1) mismatch |= left.charCodeAt(index) ^ right.charCodeAt(index);\n  return mismatch === 0;\n}\nfunction clean(value, max = 180) {\n  return String(value || '').replace(/[\\u0000-\\u001F\\u007F]/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, max);\n}\nfunction domainFrom(value) {\n  const raw = clean(value, 300).toLowerCase();\n  if (!raw) return '';\n  try { return new URL(raw.includes('://') ? raw : 'https://' + raw).hostname.replace(/^www\\./, ''); } catch { return ''; }\n}\nconst responseEnvelope = body.response && typeof body.response === 'object' ? body.response : {};\nconst rawCompanies = Array.isArray(body.companies) ? body.companies : Array.isArray(responseEnvelope.companies) ? responseEnvelope.companies : [body.company || body];\nconst peopleLimit = Math.max(1, Math.min(10, Math.floor(Number(body.people_limit_per_company || 5) || 5)));\nconst seen = new Set();\nconst companies = rawCompanies.map((company) => {\n  const item = company && typeof company === 'object' ? company : { domain: company };\n  const domain = domainFrom(item.domain || item.website);\n  return { company_id: clean(item.company_id || item.id, 120), company_name: clean(item.company_name || item.name, 180), domain, website: clean(item.website, 300), people_limit: peopleLimit };\n}).filter((company) => {\n  if (!company.domain || seen.has(company.domain)) return false;\n  seen.add(company.domain);\n  return true;\n}).slice(0, 10);\nconst basisConfirmed = body.outreach_basis_confirmed === true || String(body.outreach_basis_confirmed || '').toLowerCase() === 'true';\nconst errors = [];\nif (!expectedKey) errors.push('server_auth_not_configured');\nif (!safeEqual(presentedKey, expectedKey)) errors.push('unauthorized');\nif (!basisConfirmed) errors.push('outreach_basis_confirmation_required');\nif (companies.length === 0) errors.push('at_least_one_valid_domain_required');\nconst idempotencyKey = companies.map((company) => company.domain).sort().join('|');\nreturn [{ json: { auth_valid: safeEqual(presentedKey, expectedKey), valid: errors.length === 0, errors, dry_run: DRY_RUN, request_id: clean(body.request_id, 120) || 'people-' + Date.now().toString(36), idempotency_key: idempotencyKey, people_limit_per_company: peopleLimit, input_company_count: rawCompanies.length, unique_company_count: companies.length, companies } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-820, 0],
+      "id": "00000000-0000-4003-8000-000000000003",
+      "name": "Validate and Prepare Companies"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 3},
+          "conditions": [{"id": "00000000-0000-4003-a000-000000000004", "leftValue": "={{ Boolean($json.auth_valid && $json.valid) }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [-580, 0],
+      "id": "00000000-0000-4003-8000-000000000004",
+      "name": "Companies Ready?"
+    },
+    {
+      "parameters": {"jsCode": "const data = $input.first().json;\nreturn [{ json: { response_code: data.auth_valid ? 400 : 401, response: { ok: false, status: data.auth_valid ? 'invalid_request' : 'unauthorized', request_id: data.request_id || null, errors: data.errors || ['invalid_request'] } } }];"},
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-340, 260],
+      "id": "00000000-0000-4003-8000-000000000005",
+      "name": "Build Invalid Company Response"
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{ $json.response }}", "options": {"responseCode": "={{ $json.response_code }}"}},
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [-100, 260],
+      "id": "00000000-0000-4003-8000-000000000006",
+      "name": "Return Invalid Companies"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 3},
+          "conditions": [{"id": "00000000-0000-4003-a000-000000000007", "leftValue": "={{ $json.dry_run }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [-340, 0],
+      "id": "00000000-0000-4003-8000-000000000007",
+      "name": "Dry Run?"
+    },
+    {
+      "parameters": {"jsCode": "const data = $input.first().json;\nreturn [{ json: { response: { ok: true, status: 'validated_dry_run', dry_run: true, request_id: data.request_id, company_count: data.unique_company_count, requested_domains: data.companies.map((company) => company.domain), decision_maker_count: 0, decision_makers: [], apollo_action: 'skipped', next_workflow: 'JavedAI 04 - Email Find and Verify' } } }];"},
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-100, -160],
+      "id": "00000000-0000-4003-8000-000000000008",
+      "name": "Build People Dry-Run Response"
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nreturn data.companies.map((company) => ({ json: { ...company, request_id: data.request_id, idempotency_key: data.idempotency_key } }));"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-100, 80],
+      "id": "00000000-0000-4003-8000-000000000009",
+      "name": "Emit Unique Company Items"
+    },
+    {
+      "parameters": {"batchSize": 1, "options": {}},
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [140, 80],
+      "id": "00000000-0000-4003-8000-000000000010",
+      "name": "Loop Over Companies"
+    },
+    {
+      "parameters": {"amount": 1},
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [380, 180],
+      "id": "00000000-0000-4003-8000-000000000011",
+      "name": "Respect Apollo Rate Limit",
+      "webhookId": "00000000-0000-4003-9000-000000000011"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.apollo.io/api/v1/mixed_people/api_search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "Accept", "value": "application/json"}]},
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {"name": "q_organization_domains_list[]", "value": "={{ $json.domain }}"},
+            {"name": "person_seniorities[]", "value": "owner"},
+            {"name": "person_seniorities[]", "value": "founder"},
+            {"name": "person_seniorities[]", "value": "c_suite"},
+            {"name": "person_seniorities[]", "value": "vp"},
+            {"name": "person_seniorities[]", "value": "head"},
+            {"name": "person_seniorities[]", "value": "director"},
+            {"name": "person_seniorities[]", "value": "manager"},
+            {"name": "page", "value": "1"},
+            {"name": "per_page", "value": "={{ $json.people_limit }}"}
+          ]
+        },
+        "options": {"timeout": 15000}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [620, 180],
+      "id": "00000000-0000-4003-8000-000000000012",
+      "name": "Apollo - Search People",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "const response = $input.first().json || {};\nconst company = $node['Loop Over Companies'].json;\nconst people = Array.isArray(response.people) ? response.people : Array.isArray(response.contacts) ? response.contacts : [];\nfunction clean(value, max = 300) { return String(value || '').replace(/[\\u0000-\\u001F\\u007F]/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, max); }\nfunction titleScore(title, seniority) {\n  const value = (String(title || '') + ' ' + String(seniority || '')).toLowerCase();\n  if (/founder|owner|chief|c_suite|ceo|coo|cto|cmo/.test(value)) return 100;\n  if (/vice president|\\bvp\\b|\\bhead\\b/.test(value)) return 85;\n  if (/director/.test(value)) return 75;\n  if (/manager/.test(value)) return 60;\n  return 40;\n}\nconst normalized = people.slice(0, company.people_limit).map((person) => {\n  const firstName = clean(person.first_name, 80);\n  const lastName = clean(person.last_name, 80);\n  const organization = person.organization || {};\n  return { person_id: clean(person.id, 120), first_name: firstName, last_name: lastName, full_name: clean(person.name || [firstName, lastName].filter(Boolean).join(' '), 180), title: clean(person.title, 180), seniority: clean(person.seniority, 80), linkedin_url: clean(person.linkedin_url, 400), city: clean(person.city, 120), state: clean(person.state, 120), country: clean(person.country, 120), company_id: clean(organization.id || company.company_id, 120), company_name: clean(organization.name || company.company_name, 180), domain: clean(organization.primary_domain || company.domain, 253).toLowerCase().replace(/^www\\./, ''), email: null, phone: null, decision_maker_score: titleScore(person.title, person.seniority), source: 'apollo_people_search', needs_email_discovery: true, suppression_required: false };\n}).filter((person) => person.full_name && person.domain);\nreturn [{ json: { company_domain: company.domain, company_name: company.company_name, request_id: company.request_id, people: normalized, returned_count: normalized.length } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [860, 180],
+      "id": "00000000-0000-4003-8000-000000000013",
+      "name": "Normalize Apollo Decision Makers"
+    },
+    {
+      "parameters": {
+        "jsCode": "const batches = $input.all().map((item) => item.json);\nconst context = $node['Validate and Prepare Companies'].json;\nconst people = batches.flatMap((batch) => Array.isArray(batch.people) ? batch.people : []);\nconst seen = new Set();\nconst decisionMakers = people.filter((person) => {\n  const key = person.person_id || person.linkedin_url || (person.full_name + '|' + person.domain).toLowerCase();\n  if (!key || seen.has(key)) return false;\n  seen.add(key);\n  return true;\n}).sort((left, right) => right.decision_maker_score - left.decision_maker_score);\nreturn [{ json: { response: { ok: true, status: 'complete', dry_run: false, request_id: context.request_id, company_count: context.unique_company_count, decision_maker_count: decisionMakers.length, decision_makers: decisionMakers, email_fields_intentionally_empty: true, next_workflow: 'JavedAI 04 - Email Find and Verify' } } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [380, -60],
+      "id": "00000000-0000-4003-8000-000000000014",
+      "name": "Dedupe Rank and Package People"
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{ $json.response }}", "options": {"responseCode": 200}},
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [660, -100],
+      "id": "00000000-0000-4003-8000-000000000015",
+      "name": "Return Decision Makers"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Receive Company Records": {"main": [[{"node": "Validate and Prepare Companies", "type": "main", "index": 0}]]},
+    "Validate and Prepare Companies": {"main": [[{"node": "Companies Ready?", "type": "main", "index": 0}]]},
+    "Companies Ready?": {"main": [[{"node": "Dry Run?", "type": "main", "index": 0}], [{"node": "Build Invalid Company Response", "type": "main", "index": 0}]]},
+    "Build Invalid Company Response": {"main": [[{"node": "Return Invalid Companies", "type": "main", "index": 0}]]},
+    "Dry Run?": {"main": [[{"node": "Build People Dry-Run Response", "type": "main", "index": 0}], [{"node": "Emit Unique Company Items", "type": "main", "index": 0}]]},
+    "Build People Dry-Run Response": {"main": [[{"node": "Return Decision Makers", "type": "main", "index": 0}]]},
+    "Emit Unique Company Items": {"main": [[{"node": "Loop Over Companies", "type": "main", "index": 0}]]},
+    "Loop Over Companies": {"main": [[{"node": "Dedupe Rank and Package People", "type": "main", "index": 0}], [{"node": "Respect Apollo Rate Limit", "type": "main", "index": 0}]]},
+    "Respect Apollo Rate Limit": {"main": [[{"node": "Apollo - Search People", "type": "main", "index": 0}]]},
+    "Apollo - Search People": {"main": [[{"node": "Normalize Apollo Decision Makers", "type": "main", "index": 0}]]},
+    "Normalize Apollo Decision Makers": {"main": [[{"node": "Loop Over Companies", "type": "main", "index": 0}]]},
+    "Dedupe Rank and Package People": {"main": [[{"node": "Return Decision Makers", "type": "main", "index": 0}]]}
+  },
+  "active": false,
+  "settings": {"executionOrder": "v1", "timezone": "Europe/London"},
+  "versionId": "30000000-0000-4003-8000-000000000003",
+  "meta": {"templateCredsSetupCompleted": false},
+  "tags": []
+}

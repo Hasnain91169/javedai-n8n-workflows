@@ -1,0 +1,503 @@
+{
+  "name": "JavedAI 07 - Instantly Events",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## SETUP REQUIRED\n1. In Instantly, create webhook subscriptions for `reply_received`, `email_bounced`, and `lead_unsubscribed` (or `all_events`). Instantly API v2 supports custom delivery headers. Add a private header such as `X-JavedAI-Webhook-Secret`.\n2. Create an n8n **Header Auth** credential with the same header name/value and attach it to `Instantly Event Webhook`. n8n validates the shared secret before acknowledging the request.\n3. Configure private suppression and CRM endpoints in `Normalise Instantly Event`; attach separate Header Auth credentials to their HTTP nodes.\n4. Both endpoints must implement idempotent upserts using `event_key`, because webhook delivery may be retried.\n5. Keep `dry_run: true` until authenticated test deliveries are visible. Incoming payloads cannot turn dry-run off.\n\nThe webhook returns HTTP 202 immediately after n8n authentication, then processes asynchronously. Bounce and unsubscribe events request suppression; all supported events request a CRM status update.",
+        "height": 460,
+        "width": 650,
+        "color": 7
+      },
+      "id": "07000000-0000-4000-8000-000000000001",
+      "name": "Setup - Read Before Use",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -920,
+        -560
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "javedai/events/instantly",
+        "authentication": "headerAuth",
+        "responseMode": "onReceived",
+        "options": {
+          "responseCode": 202
+        }
+      },
+      "id": "07000000-0000-4000-8000-000000000002",
+      "name": "Instantly Event Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -880,
+        0
+      ],
+      "webhookId": "07000000-0000-4000-8000-000000000102"
+    },
+    {
+      "parameters": {
+        "jsCode": "const envelope = $input.first().json || {};\nconst body = envelope.body && typeof envelope.body === 'object' ? envelope.body : {};\nconst config = {\n  dry_run: true,\n  suppression_endpoint_url: 'https://CONFIGURE-ME.invalid/suppression/upsert',\n  crm_endpoint_url: 'https://CONFIGURE-ME.invalid/crm/outreach-event'\n};\nconst clean = (value, max = 500) => String(value ?? '').trim().replace(/\\s+/g, ' ').slice(0, max);\nconst aliases = { auto_reply_received: 'reply_received', email_reply_received: 'reply_received', bounce: 'email_bounced', unsubscribed: 'lead_unsubscribed' };\nconst rawType = clean(body.event_type || body.type, 100).toLowerCase();\nconst eventType = aliases[rawType] || rawType;\nconst supported = new Set(['reply_received', 'email_bounced', 'lead_unsubscribed']);\nconst leadEmail = clean(body.lead_email || body.email, 254).toLowerCase();\nconst emailValid = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(leadEmail);\nconst occurredAt = clean(body.timestamp || body.created_at, 80) || new Date().toISOString();\nconst seed = `${clean(body.id || body.webhook_event_id, 180)}|${eventType}|${leadEmail}|${occurredAt}|${clean(body.campaign_id, 100)}`;\nlet hash = 2166136261;\nfor (let i = 0; i < seed.length; i++) { hash ^= seed.charCodeAt(i); hash = Math.imul(hash, 16777619); }\nconst eventKey = clean(body.id || body.webhook_event_id, 180) || `inst_evt_${(hash >>> 0).toString(16).padStart(8, '0')}`;\nconst reasons = [];\nif (!supported.has(eventType)) reasons.push(`Unsupported event_type: ${rawType || 'missing'}`);\nif (!emailValid) reasons.push('Missing or invalid lead_email');\nreturn [{ json: {\n  valid: reasons.length === 0,\n  validation_reasons: reasons,\n  event_key: eventKey,\n  event_type: eventType,\n  occurred_at: occurredAt,\n  lead_email: leadEmail,\n  campaign_id: clean(body.campaign_id, 100),\n  campaign_name: clean(body.campaign_name, 200),\n  workspace_id: clean(body.workspace || body.workspace_id, 100),\n  unibox_url: clean(body.unibox_url, 500),\n  requires_suppression: eventType === 'email_bounced' || eventType === 'lead_unsubscribed',\n  suppression_reason: eventType === 'email_bounced' ? 'hard_or_provider_bounce' : eventType === 'lead_unsubscribed' ? 'unsubscribe' : '',\n  crm_status: eventType === 'reply_received' ? 'replied' : eventType === 'email_bounced' ? 'bounced' : eventType === 'lead_unsubscribed' ? 'unsubscribed' : 'unknown',\n  config\n} }];"
+      },
+      "id": "07000000-0000-4000-8000-000000000003",
+      "name": "Normalise Instantly Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -630,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "07000000-0000-4000-8000-000000000201",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "07000000-0000-4000-8000-000000000004",
+      "name": "Supported Event?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -390,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nreturn [{ json: { status: 'ignored', event_key: data.event_key, reasons: data.validation_reasons, recorded_at: new Date().toISOString() } }];"
+      },
+      "id": "07000000-0000-4000-8000-000000000005",
+      "name": "Ignore Unsupported Event",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -140,
+        250
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "07000000-0000-4000-8000-000000000202",
+              "leftValue": "={{ $json.config.dry_run }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "07000000-0000-4000-8000-000000000006",
+      "name": "Dry Run?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -140,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nreturn [{ json: { status: 'dry_run', event_key: data.event_key, event_type: data.event_type, would_suppress: data.requires_suppression, would_update_crm_to: data.crm_status, note: 'No external update was sent. Change the operator-owned dry_run constant after setup.' } }];"
+      },
+      "id": "07000000-0000-4000-8000-000000000007",
+      "name": "Dry Run Event Preview",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        110,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "07000000-0000-4000-8000-000000000203",
+              "leftValue": "={{ $json.requires_suppression }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "07000000-0000-4000-8000-000000000008",
+      "name": "Suppression Required?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        110,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "07000000-0000-4000-8000-000000000204",
+              "leftValue": "={{ !$json.config.suppression_endpoint_url.includes('CONFIGURE-ME.invalid') }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "07000000-0000-4000-8000-000000000009",
+      "name": "Suppression Endpoint Configured?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        360,
+        -10
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $node['Normalise Instantly Event'].json.config.suppression_endpoint_url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Idempotency-Key",
+              "value": "={{ $node['Normalise Instantly Event'].json.event_key }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ event_key: $node['Normalise Instantly Event'].json.event_key, email: $node['Normalise Instantly Event'].json.lead_email, reason: $node['Normalise Instantly Event'].json.suppression_reason, source: 'instantly', occurred_at: $node['Normalise Instantly Event'].json.occurred_at }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "07000000-0000-4000-8000-000000000010",
+      "name": "Upsert Suppression Record",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        610,
+        -80
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $node['Normalise Instantly Event'].json;\nreturn [{ json: { status: 'configuration_error', event_key: data.event_key, missing: 'suppression_endpoint_url', warning: 'Suppression was required but not written. Keep the workflow in dry-run until this endpoint is configured.' } }];"
+      },
+      "id": "07000000-0000-4000-8000-000000000011",
+      "name": "Flag Missing Suppression Sink",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        610,
+        100
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "07000000-0000-4000-8000-000000000205",
+              "leftValue": "={{ !$node['Normalise Instantly Event'].json.config.crm_endpoint_url.includes('CONFIGURE-ME.invalid') }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "07000000-0000-4000-8000-000000000012",
+      "name": "CRM Endpoint Configured?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        870,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $node['Normalise Instantly Event'].json.config.crm_endpoint_url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Idempotency-Key",
+              "value": "={{ $node['Normalise Instantly Event'].json.event_key }}"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ event_key: $node['Normalise Instantly Event'].json.event_key, event_type: $node['Normalise Instantly Event'].json.event_type, email: $node['Normalise Instantly Event'].json.lead_email, status: $node['Normalise Instantly Event'].json.crm_status, campaign_id: $node['Normalise Instantly Event'].json.campaign_id, occurred_at: $node['Normalise Instantly Event'].json.occurred_at, conversation_url: $node['Normalise Instantly Event'].json.unibox_url }) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "07000000-0000-4000-8000-000000000013",
+      "name": "Upsert CRM Outreach Status",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1120,
+        -60
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $node['Normalise Instantly Event'].json;\nreturn [{ json: { status: 'configuration_error', event_key: data.event_key, missing: 'crm_endpoint_url', warning: 'CRM status was not written. Keep the workflow in dry-run until this endpoint is configured.' } }];"
+      },
+      "id": "07000000-0000-4000-8000-000000000014",
+      "name": "Flag Missing CRM Sink",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1120,
+        100
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Instantly Event Webhook": {
+      "main": [
+        [
+          {
+            "node": "Normalise Instantly Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise Instantly Event": {
+      "main": [
+        [
+          {
+            "node": "Supported Event?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Supported Event?": {
+      "main": [
+        [
+          {
+            "node": "Dry Run?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Ignore Unsupported Event",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dry Run?": {
+      "main": [
+        [
+          {
+            "node": "Dry Run Event Preview",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Suppression Required?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Suppression Required?": {
+      "main": [
+        [
+          {
+            "node": "Suppression Endpoint Configured?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "CRM Endpoint Configured?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Suppression Endpoint Configured?": {
+      "main": [
+        [
+          {
+            "node": "Upsert Suppression Record",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Flag Missing Suppression Sink",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Upsert Suppression Record": {
+      "main": [
+        [
+          {
+            "node": "CRM Endpoint Configured?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Flag Missing Suppression Sink": {
+      "main": [
+        [
+          {
+            "node": "CRM Endpoint Configured?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "CRM Endpoint Configured?": {
+      "main": [
+        [
+          {
+            "node": "Upsert CRM Outreach Status",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Flag Missing CRM Sink",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/London"
+  },
+  "versionId": "07000000-0000-4000-8000-000000000999",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}

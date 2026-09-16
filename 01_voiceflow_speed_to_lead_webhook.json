@@ -1,0 +1,272 @@
+{
+  "name": "JavedAI 01 - Voiceflow Speed-to-Lead Webhook",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## SETUP REQUIRED\n\nPurpose: secure Voiceflow-facing speed-to-lead backend with validation, idempotency, qualification, and HubSpot contact upsert.\n\n1. Create the server environment variable VOICEFLOW_WEBHOOK_KEY and send the same value from Voiceflow in the x-javedai-key header.\n2. Open **Validate and Normalize Request** and keep DRY_RUN = true until tests pass. Change it to false only when HubSpot is connected.\n3. On each HubSpot HTTP Request node, select a Header Auth credential whose header is Authorization and whose value is Bearer plus your HubSpot private-app token. Required scopes: contacts read/write.\n4. In Workflow Settings, select **JavedAI 99 - Central Error Handler** after all workflows are imported. No static workflow ID is embedded here.\n5. Test 401, 400, duplicate, dry-run, create, and update paths before activation.\n\nExpected body fields: event_id, name or first_name/last_name, email and/or phone, company, website, use_case, budget, timeline, and consent_to_contact set to true.\n\nSecurity: inactive on import; no credentials or personal records are included. Static-data idempotency persists only in active production executions."
+      },
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [-1280, -520],
+      "id": "00000000-0000-4001-8000-000000000001",
+      "name": "Setup and Security Notes"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "javedai-voiceflow-speed-to-lead",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [-1240, 0],
+      "id": "00000000-0000-4001-8000-000000000002",
+      "name": "Receive Voiceflow Lead",
+      "webhookId": "00000000-0000-4001-9000-000000000002"
+    },
+    {
+      "parameters": {
+        "jsCode": "const webhook = $input.first()?.json || {};\nconst body = webhook.body && typeof webhook.body === 'object' ? webhook.body : {};\nconst headers = Object.fromEntries(Object.entries(webhook.headers || {}).map(([key, value]) => [String(key).toLowerCase(), value]));\nconst expectedKey = String($env.VOICEFLOW_WEBHOOK_KEY || '').trim();\nconst presentedKey = String(headers['x-javedai-key'] || '').trim();\nconst DRY_RUN = true;\n\nfunction safeEqual(left, right) {\n  if (!left || !right || left.length !== right.length) return false;\n  let mismatch = 0;\n  for (let index = 0; index < left.length; index += 1) mismatch |= left.charCodeAt(index) ^ right.charCodeAt(index);\n  return mismatch === 0;\n}\n\nfunction cleanText(value, maxLength = 300) {\n  return String(value || '').replace(/[\\u0000-\\u001F\\u007F]/g, ' ').replace(/\\s+/g, ' ').trim().slice(0, maxLength);\n}\n\nfunction cleanEmail(value) {\n  return cleanText(value, 254).toLowerCase();\n}\n\nfunction cleanPhone(value) {\n  const raw = cleanText(value, 40);\n  if (!raw) return '';\n  const hasPlus = raw.startsWith('+');\n  const digits = raw.replace(/\\D/g, '').slice(0, 15);\n  return digits ? (hasPlus ? '+' : '') + digits : '';\n}\n\nconst fullName = cleanText(body.name || [body.first_name, body.last_name].filter(Boolean).join(' '), 120);\nconst nameParts = fullName.split(' ').filter(Boolean);\nconst firstName = cleanText(body.first_name || nameParts[0] || '', 60);\nconst lastName = cleanText(body.last_name || nameParts.slice(1).join(' '), 60);\nconst email = cleanEmail(body.email);\nconst phone = cleanPhone(body.phone);\nconst consent = body.consent_to_contact === true || String(body.consent_to_contact || '').toLowerCase() === 'true';\nconst errors = [];\n\nif (!expectedKey) errors.push('server_auth_not_configured');\nif (!safeEqual(presentedKey, expectedKey)) errors.push('unauthorized');\nif (!email && !phone) errors.push('email_or_phone_required');\nif (email && !/^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/.test(email)) errors.push('invalid_email');\nif (phone && phone.replace(/\\D/g, '').length < 7) errors.push('invalid_phone');\nif (!consent) errors.push('consent_to_contact_required');\n\nconst useCase = cleanText(body.use_case || body.message || body.intent, 1000);\nconst budget = cleanText(body.budget, 80);\nconst timeline = cleanText(body.timeline, 80);\nlet leadScore = 20;\nif (email) leadScore += 10;\nif (phone) leadScore += 15;\nif (cleanText(body.company, 150)) leadScore += 10;\nif (useCase.length >= 40) leadScore += 15;\nif (budget) leadScore += 15;\nif (timeline) leadScore += 15;\nleadScore = Math.min(100, leadScore);\n\nconst qualification = leadScore >= 70 ? 'high' : leadScore >= 50 ? 'medium' : 'low';\nconst route = qualification === 'high' ? 'priority_sales_callback' : qualification === 'medium' ? 'sales_nurture' : 'self_service_nurture';\nconst seed = [email, phone, String(body.event_id || ''), useCase].join('|').toLowerCase();\nlet hash = 2166136261;\nfor (let index = 0; index < seed.length; index += 1) {\n  hash ^= seed.charCodeAt(index);\n  hash = Math.imul(hash, 16777619);\n}\nconst generatedId = 'vf-' + (hash >>> 0).toString(16);\n\nreturn [{ json: { auth_valid: safeEqual(presentedKey, expectedKey), valid: errors.length === 0, errors, dry_run: DRY_RUN, request_id: cleanText(body.event_id, 120) || generatedId, received_at: new Date().toISOString(), lead_score: leadScore, qualification, route, lead: { first_name: firstName, last_name: lastName, full_name: [firstName, lastName].filter(Boolean).join(' '), email, phone, company: cleanText(body.company, 150), website: cleanText(body.website, 300), use_case: useCase, budget, timeline, source: cleanText(body.source || 'voiceflow', 80), consent_to_contact: consent } } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-1000, 0],
+      "id": "00000000-0000-4001-8000-000000000003",
+      "name": "Validate and Normalize Request"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 3},
+          "conditions": [{"id": "00000000-0000-4001-a000-000000000004", "leftValue": "={{ Boolean($json.auth_valid && $json.valid) }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [-760, 0],
+      "id": "00000000-0000-4001-8000-000000000004",
+      "name": "Authenticated and Valid?"
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst unauthorized = !data.auth_valid;\nreturn [{ json: { response_code: unauthorized ? 401 : 400, response: { ok: false, status: unauthorized ? 'unauthorized' : 'invalid_request', request_id: data.request_id || null, errors: data.errors || ['invalid_request'] } } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-520, 240],
+      "id": "00000000-0000-4001-8000-000000000005",
+      "name": "Build Rejection Response"
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{ $json.response }}", "options": {"responseCode": "={{ $json.response_code }}"}},
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [-280, 240],
+      "id": "00000000-0000-4001-8000-000000000006",
+      "name": "Return Rejection"
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst store = $getWorkflowStaticData('global');\nstore.seen_requests = store.seen_requests || {};\nconst now = Date.now();\nconst ttlMs = 24 * 60 * 60 * 1000;\nfor (const [key, timestamp] of Object.entries(store.seen_requests)) {\n  if (!Number.isFinite(timestamp) || now - timestamp > ttlMs) delete store.seen_requests[key];\n}\nconst duplicate = Boolean(store.seen_requests[data.request_id]);\nif (!duplicate) store.seen_requests[data.request_id] = now;\nreturn [{ json: { ...data, duplicate, idempotency_window_hours: 24 } }];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-520, -80],
+      "id": "00000000-0000-4001-8000-000000000007",
+      "name": "Check Idempotency"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 3},
+          "conditions": [{"id": "00000000-0000-4001-a000-000000000008", "leftValue": "={{ $json.duplicate }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [-280, -80],
+      "id": "00000000-0000-4001-8000-000000000008",
+      "name": "Duplicate Request?"
+    },
+    {
+      "parameters": {"jsCode": "const data = $input.first().json;\nreturn [{ json: { response_code: 200, response: { ok: true, status: 'already_processed', duplicate: true, request_id: data.request_id, route: data.route, lead_score: data.lead_score } } }];"},
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [-40, -240],
+      "id": "00000000-0000-4001-8000-000000000009",
+      "name": "Build Duplicate Response"
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{ $json.response }}", "options": {"responseCode": 200}},
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [200, -240],
+      "id": "00000000-0000-4001-8000-000000000010",
+      "name": "Return Duplicate"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 3},
+          "conditions": [{"id": "00000000-0000-4001-a000-000000000011", "leftValue": "={{ $json.dry_run }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [-40, 40],
+      "id": "00000000-0000-4001-8000-000000000011",
+      "name": "Dry Run?"
+    },
+    {
+      "parameters": {"jsCode": "const data = $input.first().json;\nreturn [{ json: { response_code: 200, response: { ok: true, status: 'accepted_dry_run', dry_run: true, request_id: data.request_id, lead_score: data.lead_score, qualification: data.qualification, route: data.route, next_action: data.route === 'priority_sales_callback' ? 'offer_immediate_callback_or_booking' : 'continue_voiceflow_nurture', hubspot_action: 'skipped' } } }];"},
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [200, -80],
+      "id": "00000000-0000-4001-8000-000000000012",
+      "name": "Build Dry-Run Response"
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{ $json.response }}", "options": {"responseCode": 200}},
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [440, -80],
+      "id": "00000000-0000-4001-8000-000000000013",
+      "name": "Return Dry Run"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts/search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "Accept", "value": "application/json"}, {"name": "Content-Type", "value": "application/json"}]},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ filterGroups: [{ filters: [{ propertyName: $json.lead.email ? 'email' : 'phone', operator: 'EQ', value: $json.lead.email || $json.lead.phone }] }], properties: ['firstname', 'lastname', 'email', 'phone', 'company', 'website'], limit: 1 }) }}",
+        "options": {"timeout": 10000}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [200, 160],
+      "id": "00000000-0000-4001-8000-000000000014",
+      "name": "HubSpot - Search Contact",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {"jsCode": "const search = $input.first().json || {};\nconst source = $node['Check Idempotency'].json;\nconst lead = source.lead;\nconst existing = Array.isArray(search.results) && search.results.length > 0 ? search.results[0] : null;\nconst properties = {};\nif (lead.email) properties.email = lead.email;\nif (lead.first_name) properties.firstname = lead.first_name;\nif (lead.last_name) properties.lastname = lead.last_name;\nif (lead.phone) properties.phone = lead.phone;\nif (lead.company) properties.company = lead.company;\nif (lead.website) properties.website = lead.website;\nif (!existing) properties.lifecyclestage = 'lead';\nreturn [{ json: { ...source, hubspot_contact_id: existing?.id || '', hubspot_action: existing ? 'update' : 'create', crm_properties: properties } }];"},
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 160],
+      "id": "00000000-0000-4001-8000-000000000015",
+      "name": "Prepare HubSpot Upsert"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {"caseSensitive": true, "leftValue": "", "typeValidation": "strict", "version": 3},
+          "conditions": [{"id": "00000000-0000-4001-a000-000000000016", "leftValue": "={{ Boolean($json.hubspot_contact_id) }}", "rightValue": true, "operator": {"type": "boolean", "operation": "true", "singleValue": true}}],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.3,
+      "position": [680, 160],
+      "id": "00000000-0000-4001-8000-000000000016",
+      "name": "Contact Exists?"
+    },
+    {
+      "parameters": {
+        "method": "PATCH",
+        "url": "=https://api.hubapi.com/crm/v3/objects/contacts/{{$json.hubspot_contact_id}}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "Accept", "value": "application/json"}, {"name": "Content-Type", "value": "application/json"}]},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ properties: $json.crm_properties }) }}",
+        "options": {"timeout": 10000}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [920, 60],
+      "id": "00000000-0000-4001-8000-000000000017",
+      "name": "HubSpot - Update Contact",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.hubapi.com/crm/v3/objects/contacts",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {"parameters": [{"name": "Accept", "value": "application/json"}, {"name": "Content-Type", "value": "application/json"}]},
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ properties: $json.crm_properties }) }}",
+        "options": {"timeout": 10000}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.4,
+      "position": [920, 260],
+      "id": "00000000-0000-4001-8000-000000000018",
+      "name": "HubSpot - Create Contact",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {"jsCode": "const hubspot = $input.first().json || {};\nconst source = $node['Prepare HubSpot Upsert'].json;\nreturn [{ json: { response_code: 200, response: { ok: true, status: 'accepted', dry_run: false, request_id: source.request_id, lead_score: source.lead_score, qualification: source.qualification, route: source.route, next_action: source.route === 'priority_sales_callback' ? 'offer_immediate_callback_or_booking' : 'continue_voiceflow_nurture', hubspot_action: source.hubspot_action, hubspot_contact_id: hubspot.id || source.hubspot_contact_id || null } } }];"},
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1160, 160],
+      "id": "00000000-0000-4001-8000-000000000019",
+      "name": "Build Qualified Response"
+    },
+    {
+      "parameters": {"respondWith": "json", "responseBody": "={{ $json.response }}", "options": {"responseCode": 200}},
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [1400, 160],
+      "id": "00000000-0000-4001-8000-000000000020",
+      "name": "Return Qualified Lead"
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Receive Voiceflow Lead": {"main": [[{"node": "Validate and Normalize Request", "type": "main", "index": 0}]]},
+    "Validate and Normalize Request": {"main": [[{"node": "Authenticated and Valid?", "type": "main", "index": 0}]]},
+    "Authenticated and Valid?": {"main": [[{"node": "Check Idempotency", "type": "main", "index": 0}], [{"node": "Build Rejection Response", "type": "main", "index": 0}]]},
+    "Build Rejection Response": {"main": [[{"node": "Return Rejection", "type": "main", "index": 0}]]},
+    "Check Idempotency": {"main": [[{"node": "Duplicate Request?", "type": "main", "index": 0}]]},
+    "Duplicate Request?": {"main": [[{"node": "Build Duplicate Response", "type": "main", "index": 0}], [{"node": "Dry Run?", "type": "main", "index": 0}]]},
+    "Build Duplicate Response": {"main": [[{"node": "Return Duplicate", "type": "main", "index": 0}]]},
+    "Dry Run?": {"main": [[{"node": "Build Dry-Run Response", "type": "main", "index": 0}], [{"node": "HubSpot - Search Contact", "type": "main", "index": 0}]]},
+    "Build Dry-Run Response": {"main": [[{"node": "Return Dry Run", "type": "main", "index": 0}]]},
+    "HubSpot - Search Contact": {"main": [[{"node": "Prepare HubSpot Upsert", "type": "main", "index": 0}]]},
+    "Prepare HubSpot Upsert": {"main": [[{"node": "Contact Exists?", "type": "main", "index": 0}]]},
+    "Contact Exists?": {"main": [[{"node": "HubSpot - Update Contact", "type": "main", "index": 0}], [{"node": "HubSpot - Create Contact", "type": "main", "index": 0}]]},
+    "HubSpot - Update Contact": {"main": [[{"node": "Build Qualified Response", "type": "main", "index": 0}]]},
+    "HubSpot - Create Contact": {"main": [[{"node": "Build Qualified Response", "type": "main", "index": 0}]]},
+    "Build Qualified Response": {"main": [[{"node": "Return Qualified Lead", "type": "main", "index": 0}]]}
+  },
+  "active": false,
+  "settings": {"executionOrder": "v1", "timezone": "Europe/London"},
+  "versionId": "10000000-0000-4001-8000-000000000001",
+  "meta": {"templateCredsSetupCompleted": false},
+  "tags": []
+}

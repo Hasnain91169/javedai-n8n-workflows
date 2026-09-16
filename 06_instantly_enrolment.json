@@ -1,0 +1,763 @@
+{
+  "name": "JavedAI 06 - Instantly Enrolment",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## SETUP REQUIRED\n1. Attach **Header Auth** to `Approved Contacts Webhook`.\n2. Attach an Instantly API v2 bearer-token **Header Auth** credential to `Add Leads to Instantly`. Use an API key with the narrowest lead-create scope.\n3. Configure the private policy endpoint in `Normalise and Validate Approval`. It must check suppression, prior enrolment/idempotency, and the number enrolled today.\n4. Configure the optional audit endpoint and its own credential. The audit payload contains only operational IDs/counts.\n5. Leave `dry_run: true` until test executions pass. Change it to false only after the campaign UUID, policy service, suppression process, daily cap, and legal review are complete.\n\nInput may be `{ contacts: [...] }`, `{ contact: {...} }`, or `{ approval_record: {...} }`. The latter can be the `approval_record_template` from workflow 05 after a human sets `approved: true`, `approval_status: 'approved'`, and completes lawful-basis fields. Official Instantly v2 operation used: `POST https://api.instantly.ai/api/v2/leads/add`. The workflow also sets `skip_if_in_workspace: true` as a second deduplication layer. This template does not determine whether outreach is lawful.",
+        "height": 500,
+        "width": 650,
+        "color": 7
+      },
+      "id": "06000000-0000-4000-8000-000000000001",
+      "name": "Setup - Read Before Use",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -960,
+        -620
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "javedai/outreach/instantly-enrol",
+        "authentication": "headerAuth",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "06000000-0000-4000-8000-000000000002",
+      "name": "Approved Contacts Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        -920,
+        0
+      ],
+      "webhookId": "06000000-0000-4000-8000-000000000102"
+    },
+    {
+      "parameters": {
+        "jsCode": "const envelope = $input.first().json || {};\nconst body = envelope.body && typeof envelope.body === 'object' ? envelope.body : {};\nconst approvalRecord = body.approval_record && typeof body.approval_record === 'object' ? body.approval_record : body.approval_record_template && typeof body.approval_record_template === 'object' ? body.approval_record_template : null;\nif (!approvalRecord || Array.isArray(body.contacts) || (body.contact && typeof body.contact === 'object')) return [{ json: envelope }];\nreturn [{ json: { ...envelope, body: { ...body, contact: approvalRecord } } }];"
+      },
+      "id": "06000000-0000-4000-8000-000000000024",
+      "name": "Map Approval Record Input",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -800,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const envelope = $input.first().json || {};\nconst body = envelope.body && typeof envelope.body === 'object' ? envelope.body : {};\n// Safety controls are operator-owned. Incoming requests cannot disable dry-run, raise caps, or select another campaign.\nconst config = {\n  dry_run: true,\n  daily_cap: 25,\n  campaign_id: 'REPLACE_WITH_INSTANTLY_CAMPAIGN_UUID',\n  policy_endpoint_url: 'https://CONFIGURE-ME.invalid/outreach-policy/check',\n  audit_endpoint_url: 'https://CONFIGURE-ME.invalid/audit/outreach'\n};\nconst clean = (value, max = 500) => String(value ?? '').trim().replace(/\\s+/g, ' ').slice(0, max);\nconst emailPattern = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$/;\nconst sourceContacts = Array.isArray(body.contacts) ? body.contacts : [body.contact && typeof body.contact === 'object' ? body.contact : body];\nconst errors = [];\nif (sourceContacts.length < 1) errors.push('At least one contact is required');\nif (sourceContacts.length > config.daily_cap) errors.push(`Request exceeds the configured daily cap of ${config.daily_cap}`);\nconst hashKey = (seed) => { let hash = 2166136261; for (let i = 0; i < seed.length; i++) { hash ^= seed.charCodeAt(i); hash = Math.imul(hash, 16777619); } return (hash >>> 0).toString(16).padStart(8, '0'); };\nconst allowedBases = new Set(['explicit_consent', 'legitimate_interest_documented', 'existing_customer']);\nconst contacts = sourceContacts.slice(0, config.daily_cap).map((raw, index) => {\n  const email = clean(raw?.email, 254).toLowerCase();\n  const lawfulBasis = clean(raw?.lawful_basis, 80).toLowerCase();\n  const contactErrors = [];\n  if (!emailPattern.test(email)) contactErrors.push('valid email required');\n  if (raw?.email_verified !== true) contactErrors.push('email_verified must be true');\n  if (raw?.approved !== true || clean(raw?.approval_status, 80).toLowerCase() !== 'approved') contactErrors.push('separate human approval is required');\n  if (raw?.lawful_basis_documented !== true || !allowedBases.has(lawfulBasis)) contactErrors.push('documented lawful basis is required');\n  if (raw?.do_not_contact === true || raw?.unsubscribed === true || raw?.suppressed === true) contactErrors.push('contact is locally suppressed');\n  const keySeed = `${email}|${config.campaign_id}`;\n  const contactKey = clean(raw?.contact_key, 160) || `ct_${hashKey(email)}`;\n  const idempotencyKey = clean(raw?.idempotency_key, 180) || `instantly_${hashKey(keySeed)}`;\n  if (contactErrors.length) errors.push(`contacts[${index}]: ${contactErrors.join(', ')}`);\n  return {\n    email,\n    first_name: clean(raw?.first_name, 80),\n    last_name: clean(raw?.last_name, 100),\n    company_name: clean(raw?.company_name, 160),\n    job_title: clean(raw?.job_title, 160),\n    website: clean(raw?.website || raw?.company_domain, 240),\n    phone: clean(raw?.phone, 40),\n    personalization: clean(raw?.personalisation || raw?.personalization, 500),\n    contact_key: contactKey,\n    idempotency_key: idempotencyKey,\n    lawful_basis: lawfulBasis,\n    lawful_basis_documented: raw?.lawful_basis_documented === true,\n    approved: raw?.approved === true,\n    approval_status: clean(raw?.approval_status, 80).toLowerCase()\n  };\n});\nconst campaignId = config.campaign_id;\nif (!config.dry_run && campaignId.includes('REPLACE_WITH')) errors.push('Configure a real Instantly campaign UUID before live mode');\nreturn [{ json: {\n  request_id: clean(body.request_id, 160) || `enrol-${Date.now()}`,\n  received_at: new Date().toISOString(),\n  valid: errors.length === 0,\n  validation_errors: errors,\n  campaign_id: campaignId,\n  contacts,\n  config\n} }];"
+      },
+      "id": "06000000-0000-4000-8000-000000000003",
+      "name": "Normalise and Validate Approval",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -680,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "06000000-0000-4000-8000-000000000201",
+              "leftValue": "={{ $json.valid }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "06000000-0000-4000-8000-000000000004",
+      "name": "Approval Input Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -440,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nreturn [{ json: { status: 'rejected', stage: 'approval_validation', request_id: data.request_id, errors: data.validation_errors } }];"
+      },
+      "id": "06000000-0000-4000-8000-000000000005",
+      "name": "Build Validation Rejection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        -200,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 422
+        }
+      },
+      "id": "06000000-0000-4000-8000-000000000006",
+      "name": "Respond - Validation Rejected",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        50,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "06000000-0000-4000-8000-000000000202",
+              "leftValue": "={{ $json.config.dry_run }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "06000000-0000-4000-8000-000000000007",
+      "name": "Dry Run?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        -200,
+        -60
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nreturn [{ json: { status: 'dry_run', request_id: data.request_id, would_check_policy: true, would_enrol_count: data.contacts.length, campaign_id: data.campaign_id, contact_keys: data.contacts.map(c => c.contact_key), daily_cap: data.config.daily_cap, note: 'No policy or Instantly request was sent. Set dry_run=false in the Configuration code only after completing setup.' } }];"
+      },
+      "id": "06000000-0000-4000-8000-000000000008",
+      "name": "Build Dry Run Preview",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        40,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "06000000-0000-4000-8000-000000000009",
+      "name": "Respond - Dry Run",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        290,
+        -180
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "06000000-0000-4000-8000-000000000203",
+              "leftValue": "={{ !$json.config.policy_endpoint_url.includes('CONFIGURE-ME.invalid') }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "06000000-0000-4000-8000-000000000010",
+      "name": "Policy Service Configured?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        40,
+        40
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nreturn [{ json: { status: 'blocked', stage: 'configuration', request_id: data.request_id, errors: ['A private suppression, deduplication, and daily-cap policy endpoint is required for live mode'] } }];"
+      },
+      "id": "06000000-0000-4000-8000-000000000011",
+      "name": "Build Configuration Block",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        290,
+        250
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 503
+        }
+      },
+      "id": "06000000-0000-4000-8000-000000000012",
+      "name": "Respond - Configuration Blocked",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        540,
+        250
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $json.config.policy_endpoint_url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify({ request_id: $json.request_id, campaign_id: $json.campaign_id, daily_cap: $json.config.daily_cap, idempotency_keys: $json.contacts.map(c => c.idempotency_key), contacts: $json.contacts.map(c => ({ email: c.email, contact_key: c.contact_key })), required_checks: ['suppression','idempotency','daily_cap'] }) }}",
+        "options": {
+          "timeout": 15000
+        }
+      },
+      "id": "06000000-0000-4000-8000-000000000013",
+      "name": "Check Suppression Dedupe and Cap",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        300,
+        20
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 1000
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $node['Normalise and Validate Approval'].json;\nconst response = $input.first().json || {};\nconst suppressed = new Set((response.suppressed_emails || []).map(v => String(v).trim().toLowerCase()));\nconst duplicates = new Set((response.duplicate_keys || []).map(v => String(v)));\nconst enrolledToday = Math.max(0, Number(response.enrolled_today || 0));\nconst remaining = Math.max(0, base.config.daily_cap - enrolledToday);\nconst blocked = [];\nfor (const contact of base.contacts) {\n  if (suppressed.has(contact.email)) blocked.push({ contact_key: contact.contact_key, reason: 'suppressed' });\n  if (duplicates.has(contact.idempotency_key)) blocked.push({ contact_key: contact.contact_key, reason: 'duplicate' });\n}\nif (base.contacts.length > remaining) blocked.push({ reason: 'daily_cap', remaining, requested: base.contacts.length });\nif (response.allowed !== true) blocked.push({ reason: String(response.reason || 'policy_service_did_not_explicitly_allow') });\nreturn [{ json: { ...base, policy: { allowed: blocked.length === 0, blocked, enrolled_today: enrolledToday, remaining_before_request: remaining, checked_at: new Date().toISOString() } } }];"
+      },
+      "id": "06000000-0000-4000-8000-000000000014",
+      "name": "Evaluate Policy Response",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        550,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "06000000-0000-4000-8000-000000000204",
+              "leftValue": "={{ $json.policy.allowed }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "06000000-0000-4000-8000-000000000015",
+      "name": "Policy Explicitly Allows?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        800,
+        20
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nreturn [{ json: { status: 'blocked', stage: 'outreach_policy', request_id: data.request_id, policy: data.policy } }];"
+      },
+      "id": "06000000-0000-4000-8000-000000000016",
+      "name": "Build Policy Rejection",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1050,
+        230
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $json }}",
+        "options": {
+          "responseCode": 409
+        }
+      },
+      "id": "06000000-0000-4000-8000-000000000017",
+      "name": "Respond - Policy Blocked",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        1300,
+        230
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "const data = $input.first().json;\nconst leads = data.contacts.map(contact => ({\n  email: contact.email,\n  first_name: contact.first_name || undefined,\n  last_name: contact.last_name || undefined,\n  company_name: contact.company_name || undefined,\n  job_title: contact.job_title || undefined,\n  website: contact.website || undefined,\n  phone: contact.phone || undefined,\n  personalization: contact.personalization || undefined,\n  custom_variables: { source: 'javedai_n8n', request_id: data.request_id, contact_key: contact.contact_key, lawful_basis: contact.lawful_basis }\n}));\nreturn [{ json: { ...data, instantly_request: { leads, campaign_id: data.campaign_id, verify_leads_on_import: false, skip_if_in_workspace: true } } }];"
+      },
+      "id": "06000000-0000-4000-8000-000000000018",
+      "name": "Prepare Instantly v2 Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1050,
+        -50
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.instantly.ai/api/v2/leads/add",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($json.instantly_request) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "id": "06000000-0000-4000-8000-000000000019",
+      "name": "Add Leads to Instantly",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1300,
+        -50
+      ],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "jsCode": "const base = $node['Prepare Instantly v2 Request'].json;\nconst api = $input.first().json || {};\nconst accepted = Number(api.leads_uploaded ?? api.created ?? 0);\nreturn [{ json: {\n  status: api.status === 'success' ? 'enrolled' : 'submitted',\n  request_id: base.request_id,\n  campaign_id: base.campaign_id,\n  requested_count: base.contacts.length,\n  accepted_count: Number.isFinite(accepted) ? accepted : 0,\n  total_sent: Number(api.total_sent ?? base.contacts.length),\n  contact_keys: base.contacts.map(c => c.contact_key),\n  idempotency_keys: base.contacts.map(c => c.idempotency_key),\n  policy_checked_at: base.policy.checked_at,\n  completed_at: new Date().toISOString(),\n  provider_status: String(api.status || 'unknown')\n} }];"
+      },
+      "id": "06000000-0000-4000-8000-000000000020",
+      "name": "Build Enrolment Result",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1550,
+        -50
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "06000000-0000-4000-8000-000000000205",
+              "leftValue": "={{ !$node['Normalise and Validate Approval'].json.config.audit_endpoint_url.includes('CONFIGURE-ME.invalid') }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "06000000-0000-4000-8000-000000000021",
+      "name": "Audit Endpoint Configured?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1800,
+        -50
+      ]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "={{ $node['Normalise and Validate Approval'].json.config.audit_endpoint_url }}",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "contentType": "raw",
+        "rawContentType": "application/json",
+        "body": "={{ JSON.stringify($node['Build Enrolment Result'].json) }}",
+        "options": {
+          "timeout": 10000
+        }
+      },
+      "id": "06000000-0000-4000-8000-000000000022",
+      "name": "Write Sanitised Audit Event",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        2050,
+        -140
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 1000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ $node['Build Enrolment Result'].json }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "06000000-0000-4000-8000-000000000023",
+      "name": "Respond - Enrolment Result",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.4,
+      "position": [
+        2300,
+        -50
+      ]
+    }
+  ],
+  "pinData": {},
+  "connections": {
+    "Approved Contacts Webhook": {
+      "main": [
+        [
+          {
+            "node": "Map Approval Record Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Map Approval Record Input": {
+      "main": [
+        [
+          {
+            "node": "Normalise and Validate Approval",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Normalise and Validate Approval": {
+      "main": [
+        [
+          {
+            "node": "Approval Input Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Approval Input Valid?": {
+      "main": [
+        [
+          {
+            "node": "Dry Run?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Validation Rejection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Validation Rejection": {
+      "main": [
+        [
+          {
+            "node": "Respond - Validation Rejected",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dry Run?": {
+      "main": [
+        [
+          {
+            "node": "Build Dry Run Preview",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Policy Service Configured?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Dry Run Preview": {
+      "main": [
+        [
+          {
+            "node": "Respond - Dry Run",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Policy Service Configured?": {
+      "main": [
+        [
+          {
+            "node": "Check Suppression Dedupe and Cap",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Configuration Block",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Configuration Block": {
+      "main": [
+        [
+          {
+            "node": "Respond - Configuration Blocked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Check Suppression Dedupe and Cap": {
+      "main": [
+        [
+          {
+            "node": "Evaluate Policy Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Evaluate Policy Response": {
+      "main": [
+        [
+          {
+            "node": "Policy Explicitly Allows?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Policy Explicitly Allows?": {
+      "main": [
+        [
+          {
+            "node": "Prepare Instantly v2 Request",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Build Policy Rejection",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Policy Rejection": {
+      "main": [
+        [
+          {
+            "node": "Respond - Policy Blocked",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare Instantly v2 Request": {
+      "main": [
+        [
+          {
+            "node": "Add Leads to Instantly",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Add Leads to Instantly": {
+      "main": [
+        [
+          {
+            "node": "Build Enrolment Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Enrolment Result": {
+      "main": [
+        [
+          {
+            "node": "Audit Endpoint Configured?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Audit Endpoint Configured?": {
+      "main": [
+        [
+          {
+            "node": "Write Sanitised Audit Event",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond - Enrolment Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Write Sanitised Audit Event": {
+      "main": [
+        [
+          {
+            "node": "Respond - Enrolment Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "timezone": "Europe/London"
+  },
+  "versionId": "06000000-0000-4000-8000-000000000999",
+  "meta": {
+    "templateCredsSetupCompleted": false
+  },
+  "tags": []
+}
